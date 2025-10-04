@@ -180,11 +180,127 @@ configure_hosts() {
     log "Updated /etc/hosts"
 }
 
+# Function to check for Let's Encrypt certificates
+check_letsencrypt_certs() {
+    LE_LIVE_DIR="/etc/letsencrypt/live"
+    CERT_FOUND=false
+    CERT_PATH=""
+    KEY_PATH=""
+    CHAIN_PATH=""
+    
+    if [ ! -d "$LE_LIVE_DIR" ]; then
+        return 1
+    fi
+    
+    log "Checking for Let's Encrypt certificates..."
+    
+    # Collect all valid certificate directories
+    CERT_DIRS=""
+    CERT_COUNT=0
+    
+    for cert_dir in "$LE_LIVE_DIR"/*; do
+        if [ -d "$cert_dir" ] && [ -f "$cert_dir/cert.pem" ] && [ -f "$cert_dir/privkey.pem" ]; then
+            cert_name=$(basename "$cert_dir")
+            # Skip README files
+            if [ "$cert_name" = "README" ]; then
+                continue
+            fi
+            CERT_DIRS="$CERT_DIRS $cert_dir"
+            CERT_COUNT=$((CERT_COUNT + 1))
+        fi
+    done
+    
+    # If no certificates found, return
+    if [ "$CERT_COUNT" -eq 0 ]; then
+        log "No Let's Encrypt certificates found in $LE_LIVE_DIR"
+        return 1
+    fi
+    
+    # If only one certificate found, use it
+    if [ "$CERT_COUNT" -eq 1 ]; then
+        CERT_DIR=$(echo "$CERT_DIRS" | tr -d ' ')
+        cert_name=$(basename "$CERT_DIR")
+        log "Found 1 Let's Encrypt certificate: $cert_name"
+        CERT_FOUND=true
+    else
+        # Multiple certificates found - let user choose
+        log "Found $CERT_COUNT Let's Encrypt certificates:"
+        i=1
+        for cert_dir in $CERT_DIRS; do
+            cert_name=$(basename "$cert_dir")
+            printf "  %d) %s\n" "$i" "$cert_name"
+            i=$((i + 1))
+        done
+        
+        printf "Select certificate to use (1-%d, 0 to skip): " "$CERT_COUNT"
+        read -r CERT_CHOICE
+        
+        if [ "$CERT_CHOICE" -eq 0 ] 2>/dev/null; then
+            log "Skipping Let's Encrypt certificates"
+            return 1
+        elif [ "$CERT_CHOICE" -ge 1 ] 2>/dev/null && [ "$CERT_CHOICE" -le "$CERT_COUNT" ]; then
+            # Get the selected certificate directory
+            i=1
+            for cert_dir in $CERT_DIRS; do
+                if [ "$i" -eq "$CERT_CHOICE" ]; then
+                    CERT_DIR="$cert_dir"
+                    CERT_FOUND=true
+                    break
+                fi
+                i=$((i + 1))
+            done
+        else
+            warn "Invalid selection, skipping Let's Encrypt certificates"
+            return 1
+        fi
+    fi
+    
+    if [ "$CERT_FOUND" = true ]; then
+        # Verify all required files exist
+        if [ -f "$CERT_DIR/cert.pem" ] && [ -f "$CERT_DIR/privkey.pem" ]; then
+            CERT_PATH="$CERT_DIR/cert.pem"
+            KEY_PATH="$CERT_DIR/privkey.pem"
+            CHAIN_PATH="$CERT_DIR/chain.pem"
+            FULLCHAIN_PATH="$CERT_DIR/fullchain.pem"
+            
+            log "Using certificate: $(basename "$CERT_DIR")"
+            log "Certificate files validated:"
+            log "  - Certificate: $CERT_PATH"
+            log "  - Private Key: $KEY_PATH"
+            log "  - Fullchain: $FULLCHAIN_PATH"
+            
+            return 0
+        else
+            warn "Certificate directory found but required files missing"
+            CERT_FOUND=false
+        fi
+    fi
+    
+    return 1
+}
+
 # Function to generate SSL certificates
 generate_ssl_certs() {
     log "Setting up SSL certificate options..."
     
-    printf "SSL Certificate setup:\n"
+    # First check for Let's Encrypt certificates
+    if check_letsencrypt_certs; then
+        printf "\nFound existing Let's Encrypt certificate!\n"
+        printf "Certificate: %s\n" "$CERT_PATH"
+        printf "Use this certificate? (y/n): "
+        read -r USE_LE
+        
+        if [ "$USE_LE" = "y" ] || [ "$USE_LE" = "Y" ]; then
+            log "Will use Let's Encrypt certificate"
+            USE_LETSENCRYPT=true
+            USE_SELFSIGNED=false
+            return
+        fi
+    fi
+    
+    USE_LETSENCRYPT=false
+    
+    printf "\nSSL Certificate setup:\n"
     printf "1) Generate self-signed certificate\n"
     printf "2) I will provide certificates later\n"
     printf "Choose option (1-2): "
@@ -257,8 +373,14 @@ install_freeipa() {
         INSTALL_CMD="$INSTALL_CMD --setup-dns --auto-forwarders"
     fi
     
-    if [ "$USE_SELFSIGNED" = true ]; then
-        INSTALL_CMD="$INSTALL_CMD --ca-cert-file= --ca-key-file="
+    # Add Let's Encrypt certificate options if available
+    if [ "$USE_LETSENCRYPT" = true ]; then
+        log "Using Let's Encrypt certificates for installation"
+        INSTALL_CMD="$INSTALL_CMD --http-cert-file=$FULLCHAIN_PATH"
+        INSTALL_CMD="$INSTALL_CMD --http-key-file=$KEY_PATH"
+        INSTALL_CMD="$INSTALL_CMD --dirsrv-cert-file=$FULLCHAIN_PATH"
+        INSTALL_CMD="$INSTALL_CMD --dirsrv-key-file=$KEY_PATH"
+        INSTALL_CMD="$INSTALL_CMD --dirsrv-pin=''"
     fi
     
     log "Running FreeIPA installation (this may take several minutes)..."
@@ -266,9 +388,50 @@ install_freeipa() {
     
     if [ $? -eq 0 ]; then
         log "FreeIPA server installation completed successfully"
+        
+        # If using Let's Encrypt, create symlinks for easier renewal
+        if [ "$USE_LETSENCRYPT" = true ]; then
+            configure_letsencrypt_renewal
+        fi
     else
         error "FreeIPA installation failed"
     fi
+}
+
+# Function to configure Let's Encrypt certificate renewal
+configure_letsencrypt_renewal() {
+    log "Configuring Let's Encrypt certificate renewal integration..."
+    
+    # Create renewal hook script
+    RENEWAL_HOOK_DIR="/etc/letsencrypt/renewal-hooks/deploy"
+    mkdir -p "$RENEWAL_HOOK_DIR"
+    
+    cat > "$RENEWAL_HOOK_DIR/freeipa-renew.sh" << 'EOF'
+#!/bin/sh
+# FreeIPA Certificate Renewal Hook for Let's Encrypt
+
+CERT_DOMAIN="$RENEWED_DOMAINS"
+CERT_PATH="$RENEWED_LINEAGE/fullchain.pem"
+KEY_PATH="$RENEWED_LINEAGE/privkey.pem"
+
+# Restart FreeIPA services to pick up new certificate
+if [ -f "$CERT_PATH" ] && [ -f "$KEY_PATH" ]; then
+    systemctl restart httpd
+    systemctl restart dirsrv@*
+    logger -t letsencrypt "FreeIPA certificates renewed for $CERT_DOMAIN"
+fi
+EOF
+
+    chmod +x "$RENEWAL_HOOK_DIR/freeipa-renew.sh"
+    log "Created Let's Encrypt renewal hook at $RENEWAL_HOOK_DIR/freeipa-renew.sh"
+    
+    # Update Apache configuration to use Let's Encrypt certs
+    if [ -f "/etc/httpd/conf.d/ssl.conf" ]; then
+        sed -i "s|SSLCertificateFile.*|SSLCertificateFile $FULLCHAIN_PATH|" /etc/httpd/conf.d/ssl.conf
+        sed -i "s|SSLCertificateKeyFile.*|SSLCertificateKeyFile $KEY_PATH|" /etc/httpd/conf.d/ssl.conf
+    fi
+    
+    log "Let's Encrypt certificate renewal configured"
 }
 
 # Function to configure for reverse proxy
@@ -343,12 +506,28 @@ display_summary() {
     printf "Admin Password: %s\n" "$ADMIN_PASSWORD"
     printf "Directory Manager Password: %s\n" "$DM_PASSWORD"
     printf "Services: CA=Yes, DNS=%s\n" "$([ "$INSTALL_DNS" = true ] && echo "Yes" || echo "No")"
+    
+    if [ "$USE_LETSENCRYPT" = true ]; then
+        printf "SSL Certificate: Let's Encrypt\n"
+        printf "Certificate Path: %s\n" "$CERT_PATH"
+        printf "Auto-renewal: Configured\n"
+    elif [ "$USE_SELFSIGNED" = true ]; then
+        printf "SSL Certificate: Self-signed (generated by FreeIPA)\n"
+    else
+        printf "SSL Certificate: Manual configuration required\n"
+    fi
+    
     echo "=========================="
     echo ""
     echo "Next Steps:"
     echo "1. Configure your reverse proxy to forward to https://$HOSTNAME:$FREEIPA_PORT"
     echo "2. Access FreeIPA web UI through your reverse proxy"
     echo "3. Save the admin and Directory Manager passwords securely"
+    
+    if [ "$USE_LETSENCRYPT" = true ]; then
+        echo "4. Let's Encrypt certificates will auto-renew (renewal hook configured)"
+    fi
+    
     echo ""
     echo "Reverse Proxy Configuration Example (Nginx):"
     echo "    location / {"
@@ -357,7 +536,11 @@ display_summary() {
     echo "        proxy_set_header X-Real-IP \$remote_addr;"
     echo "        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;"
     echo "        proxy_set_header X-Forwarded-Proto \$scheme;"
-    echo "        proxy_ssl_verify off;"
+    
+    if [ "$USE_SELFSIGNED" = true ]; then
+        echo "        proxy_ssl_verify off;"
+    fi
+    
     echo "    }"
 }
 
