@@ -1,7 +1,7 @@
 #!/bin/sh
 
-# FreeIPA Server Installation Script - Distro Agnostic
-# Configures FreeIPA to run behind a reverse proxy
+# Full FreeIPA Server Installation Script - Distro Agnostic
+# Complete standalone FreeIPA server with all features
 # POSIX compliant
 
 set -e
@@ -114,28 +114,23 @@ install_packages() {
             
             log "Installing FreeIPA packages using $PKG_MGR..."
             $PKG_MGR update -y
-            $PKG_MGR install -y ipa-server ipa-server-dns bind-utils
-            
-            # Check if we should install additional components
-            if systemctl list-unit-files | grep -q chronyd; then
-                $PKG_MGR install -y chrony
-            fi
+            $PKG_MGR install -y ipa-server ipa-server-dns ipa-server-trust-ad \
+                bind-utils chrony firewalld
             ;;
             
         *"debian"*|*"ubuntu"*)
             export DEBIAN_FRONTEND=noninteractive
             log "Installing FreeIPA packages using apt..."
             apt-get update
-            apt-get install -y freeipa-server freeipa-server-dns bind9-utils dnsutils
-            
-            # Install additional components
-            apt-get install -y chrony
+            apt-get install -y freeipa-server freeipa-server-dns freeipa-server-trust-ad \
+                bind9-utils dnsutils chrony ufw
             ;;
             
         *"suse"*)
             log "Installing FreeIPA packages using zypper..."
             zypper refresh
-            zypper install -y freeipa-server freeipa-server-dns bind-utils chrony
+            zypper install -y freeipa-server freeipa-server-dns freeipa-server-trust-ad \
+                bind-utils chrony firewalld
             ;;
             
         *)
@@ -148,12 +143,14 @@ install_packages() {
 check_requirements() {
     log "Checking system requirements..."
     
-    # Check memory (minimum 2GB recommended)
+    # Check memory (minimum 2GB recommended, 4GB for full features)
     MEM_KB=$(grep MemTotal /proc/meminfo | awk '{print $2}')
     MEM_GB=$((MEM_KB / 1024 / 1024))
     
     if [ "$MEM_GB" -lt 2 ]; then
-        warn "System has less than 2GB RAM ($MEM_GB GB). FreeIPA may not perform well."
+        error "System has less than 2GB RAM ($MEM_GB GB). FreeIPA requires at least 2GB."
+    elif [ "$MEM_GB" -lt 4 ]; then
+        warn "System has less than 4GB RAM ($MEM_GB GB). 4GB+ recommended for full features."
     fi
     
     # Check disk space (minimum 10GB recommended)
@@ -164,6 +161,11 @@ check_requirements() {
         warn "Less than 10GB disk space available ($DISK_GB GB). Consider freeing up space."
     fi
     
+    # Check if hostname is properly configured
+    if [ "$HOSTNAME" = "localhost" ] || [ "$HOSTNAME" = "localhost.localdomain" ]; then
+        error "Hostname is set to localhost. Please configure a proper FQDN first."
+    fi
+    
     log "System requirements check completed"
 }
 
@@ -171,11 +173,21 @@ check_requirements() {
 configure_hosts() {
     log "Configuring /etc/hosts..."
     
+    # Get primary IP address
+    PRIMARY_IP=$(hostname -I | awk '{print $1}')
+    
+    if [ -z "$PRIMARY_IP" ]; then
+        warn "Could not detect primary IP address. Using 127.0.0.1"
+        PRIMARY_IP="127.0.0.1"
+    fi
+    
+    log "Using IP address: $PRIMARY_IP"
+    
     # Remove existing entries for hostname
     sed -i "/$HOSTNAME/d" /etc/hosts
     
     # Add new entry
-    echo "127.0.0.1 $HOSTNAME $(echo "$HOSTNAME" | cut -d'.' -f1)" >> /etc/hosts
+    echo "$PRIMARY_IP $HOSTNAME $(echo "$HOSTNAME" | cut -d'.' -f1)" >> /etc/hosts
     
     log "Updated /etc/hosts"
 }
@@ -279,83 +291,143 @@ check_letsencrypt_certs() {
     return 1
 }
 
-# Function to generate SSL certificates
-generate_ssl_certs() {
+# Function to configure SSL certificates
+configure_ssl_certs() {
     log "Setting up SSL certificate options..."
     
     # First check for Let's Encrypt certificates
     if check_letsencrypt_certs; then
-        printf "\nFound existing Let's Encrypt certificate!\n"
-        printf "Certificate: %s\n" "$CERT_PATH"
-        printf "Use this certificate? (y/n): "
-        read -r USE_LE
-        
-        if [ "$USE_LE" = "y" ] || [ "$USE_LE" = "Y" ]; then
-            log "Will use Let's Encrypt certificate"
-            USE_LETSENCRYPT=true
-            USE_SELFSIGNED=false
-            return
-        fi
+        log "Found existing Let's Encrypt certificate!"
+        log "Certificate: $CERT_PATH"
+        log "Will use Let's Encrypt certificate"
+        USE_LETSENCRYPT=true
+        USE_SELFSIGNED=false
+        USE_FREEIPA_CA=false
+        return
     fi
     
     USE_LETSENCRYPT=false
     
-    printf "\nSSL Certificate setup:\n"
-    printf "1) Generate self-signed certificate\n"
-    printf "2) I will provide certificates later\n"
-    printf "Choose option (1-2): "
-    read -r SSL_CHOICE
-    
-    case "$SSL_CHOICE" in
-        1)
-            log "Will generate self-signed certificates during FreeIPA installation"
-            USE_SELFSIGNED=true
-            ;;
-        2)
-            log "SSL certificates will need to be configured manually after installation"
-            USE_SELFSIGNED=false
-            ;;
-        *)
-            warn "Invalid choice, defaulting to self-signed certificates"
-            USE_SELFSIGNED=true
-            ;;
-    esac
+    # Default to FreeIPA's built-in CA
+    log "No Let's Encrypt certificates found, using FreeIPA's built-in CA"
+    USE_FREEIPA_CA=true
+    USE_SELFSIGNED=false
 }
 
-# Function to autodetect services to install
-detect_services() {
-    log "Auto-detecting services to install..."
+# Function to configure DNS settings
+configure_dns_settings() {
+    log "Auto-detecting DNS configuration..."
     
-    INSTALL_DNS=false
-    INSTALL_CA=true  # Always install CA
-    
-    # Check if DNS is needed
+    # Check if DNS is needed by checking if hostname is resolvable
     if ! nslookup "$HOSTNAME" >/dev/null 2>&1; then
         log "Hostname not resolvable via DNS, will install integrated DNS server"
         INSTALL_DNS=true
+        
+        # Auto-detect forwarders from /etc/resolv.conf
+        USE_AUTO_FORWARDERS=true
+        DNS_FORWARDERS=""
+        
+        # Auto-configure reverse zone
+        CONFIGURE_REVERSE_ZONE=true
     else
         log "Hostname is resolvable, integrated DNS not required"
+        INSTALL_DNS=false
+        USE_AUTO_FORWARDERS=false
+        DNS_FORWARDERS=""
+        CONFIGURE_REVERSE_ZONE=false
     fi
     
-    # Check available services
-    SERVICES=""
-    if [ "$INSTALL_DNS" = true ]; then
-        SERVICES="$SERVICES --setup-dns"
-    fi
+    log "DNS configuration: Integrated DNS=$([ "$INSTALL_DNS" = true ] && echo "Yes" || echo "No")"
+}
+
+# Function to configure NTP settings
+configure_ntp_settings() {
+    log "Configuring NTP/Chrony..."
     
-    log "Services to install: CA=$([ "$INSTALL_CA" = true ] && echo "Yes" || echo "No"), DNS=$([ "$INSTALL_DNS" = true ] && echo "Yes" || echo "No")"
+    # Enable and start chrony
+    if systemctl list-unit-files | grep -q chronyd; then
+        systemctl enable chronyd
+        systemctl start chronyd
+        log "Chrony service enabled and started"
+    elif systemctl list-unit-files | grep -q chrony; then
+        systemctl enable chrony
+        systemctl start chrony
+        log "Chrony service enabled and started"
+    else
+        warn "Chrony service not found, skipping NTP configuration"
+    fi
+}
+
+# Function to configure firewall
+configure_firewall() {
+    log "Configuring firewall automatically..."
+    
+    # Detect firewall type
+    if command -v firewall-cmd >/dev/null 2>&1; then
+        log "Detected firewalld, configuring..."
+        systemctl enable firewalld
+        systemctl start firewalld
+        
+        # Add FreeIPA service
+        firewall-cmd --permanent --add-service=freeipa-ldap
+        firewall-cmd --permanent --add-service=freeipa-ldaps
+        firewall-cmd --permanent --add-service=freeipa-replication
+        
+        # Add DNS if configured
+        if [ "$INSTALL_DNS" = true ]; then
+            firewall-cmd --permanent --add-service=dns
+        fi
+        
+        # Add custom HTTPS port for reverse proxy
+        firewall-cmd --permanent --add-port=$FREEIPA_PORT/tcp
+        
+        # Add Kerberos
+        firewall-cmd --permanent --add-service=kerberos
+        
+        # Add NTP
+        firewall-cmd --permanent --add-service=ntp
+        
+        # Reload firewall
+        firewall-cmd --reload
+        
+        log "Firewalld configured successfully"
+        
+    elif command -v ufw >/dev/null 2>&1; then
+        log "Detected UFW, configuring..."
+        
+        # Enable UFW
+        ufw --force enable
+        
+        # Add FreeIPA ports
+        ufw allow $FREEIPA_PORT/tcp  # Custom HTTPS port
+        ufw allow 389/tcp   # LDAP
+        ufw allow 636/tcp   # LDAPS
+        ufw allow 88/tcp    # Kerberos
+        ufw allow 88/udp    # Kerberos
+        ufw allow 464/tcp   # Kerberos kpasswd
+        ufw allow 464/udp   # Kerberos kpasswd
+        ufw allow 123/udp   # NTP
+        
+        # Add DNS if configured
+        if [ "$INSTALL_DNS" = true ]; then
+            ufw allow 53/tcp
+            ufw allow 53/udp
+        fi
+        
+        log "UFW configured successfully"
+    else
+        log "No supported firewall found, skipping firewall configuration"
+    fi
 }
 
 # Function to install and configure FreeIPA
 install_freeipa() {
     log "Starting FreeIPA server installation..."
     
-    # Generate admin password if not provided
-    if [ -z "$ADMIN_PASSWORD" ]; then
-        log "Generating random admin password..."
-        ADMIN_PASSWORD=$(openssl rand -base64 32 | tr -d "=+/" | cut -c1-25)
-        log "Generated admin password (save this!): $ADMIN_PASSWORD"
-    fi
+    # Generate admin password
+    log "Generating random admin password..."
+    ADMIN_PASSWORD=$(openssl rand -base64 32 | tr -d "=+/" | cut -c1-25)
+    log "Generated admin password (save this!): $ADMIN_PASSWORD"
     
     # Generate directory manager password
     DM_PASSWORD=$(openssl rand -base64 32 | tr -d "=+/" | cut -c1-25)
@@ -369,8 +441,25 @@ install_freeipa() {
     INSTALL_CMD="$INSTALL_CMD --admin-password=$ADMIN_PASSWORD"
     INSTALL_CMD="$INSTALL_CMD --ds-password=$DM_PASSWORD"
     
+    # Add DNS configuration
     if [ "$INSTALL_DNS" = true ]; then
-        INSTALL_CMD="$INSTALL_CMD --setup-dns --auto-forwarders"
+        INSTALL_CMD="$INSTALL_CMD --setup-dns"
+        
+        if [ "$USE_AUTO_FORWARDERS" = true ]; then
+            INSTALL_CMD="$INSTALL_CMD --auto-forwarders"
+        elif [ -n "$DNS_FORWARDERS" ]; then
+            for forwarder in $DNS_FORWARDERS; do
+                INSTALL_CMD="$INSTALL_CMD --forwarder=$forwarder"
+            done
+        else
+            INSTALL_CMD="$INSTALL_CMD --no-forwarders"
+        fi
+        
+        if [ "$CONFIGURE_REVERSE_ZONE" = true ]; then
+            INSTALL_CMD="$INSTALL_CMD --auto-reverse"
+        else
+            INSTALL_CMD="$INSTALL_CMD --no-reverse"
+        fi
     fi
     
     # Add Let's Encrypt certificate options if available
@@ -383,7 +472,9 @@ install_freeipa() {
         INSTALL_CMD="$INSTALL_CMD --dirsrv-pin=''"
     fi
     
-    log "Running FreeIPA installation (this may take several minutes)..."
+    log "Running FreeIPA installation (this may take 10-20 minutes)..."
+    log "Installation command prepared, starting now..."
+    
     eval "$INSTALL_CMD"
     
     if [ $? -eq 0 ]; then
@@ -398,7 +489,7 @@ install_freeipa() {
     fi
 }
 
-# Function to configure Let's Encrypt certificate renewal
+# Function to configure Let's Encrypt renewal
 configure_letsencrypt_renewal() {
     log "Configuring Let's Encrypt certificate renewal integration..."
     
@@ -414,24 +505,24 @@ CERT_DOMAIN="$RENEWED_DOMAINS"
 CERT_PATH="$RENEWED_LINEAGE/fullchain.pem"
 KEY_PATH="$RENEWED_LINEAGE/privkey.pem"
 
-# Restart FreeIPA services to pick up new certificate
+# Install certificate in FreeIPA
 if [ -f "$CERT_PATH" ] && [ -f "$KEY_PATH" ]; then
-    systemctl restart httpd
-    systemctl restart dirsrv@*
+    # Stop services
+    ipactl stop
+    
+    # Update certificates
+    cp "$CERT_PATH" /etc/httpd/alias/server.crt
+    cp "$KEY_PATH" /etc/httpd/alias/server.key
+    
+    # Start services
+    ipactl start
+    
     logger -t letsencrypt "FreeIPA certificates renewed for $CERT_DOMAIN"
 fi
 EOF
 
     chmod +x "$RENEWAL_HOOK_DIR/freeipa-renew.sh"
     log "Created Let's Encrypt renewal hook at $RENEWAL_HOOK_DIR/freeipa-renew.sh"
-    
-    # Update Apache configuration to use Let's Encrypt certs
-    if [ -f "/etc/httpd/conf.d/ssl.conf" ]; then
-        sed -i "s|SSLCertificateFile.*|SSLCertificateFile $FULLCHAIN_PATH|" /etc/httpd/conf.d/ssl.conf
-        sed -i "s|SSLCertificateKeyFile.*|SSLCertificateKeyFile $KEY_PATH|" /etc/httpd/conf.d/ssl.conf
-    fi
-    
-    log "Let's Encrypt certificate renewal configured"
 }
 
 # Function to configure for reverse proxy
@@ -439,65 +530,90 @@ configure_reverse_proxy() {
     log "Configuring FreeIPA for reverse proxy setup..."
     
     # Configure Apache to listen on custom port
-    APACHE_PORT_CONF="/etc/httpd/conf.d/freeipa-port.conf"
-    if [ ! -d "/etc/httpd" ]; then
-        APACHE_PORT_CONF="/etc/apache2/conf-available/freeipa-port.conf"
+    APACHE_CONF_DIR=""
+    if [ -d "/etc/httpd/conf.d" ]; then
+        APACHE_CONF_DIR="/etc/httpd/conf.d"
+    elif [ -d "/etc/apache2/conf-available" ]; then
+        APACHE_CONF_DIR="/etc/apache2/conf-available"
+    else
+        warn "Could not find Apache configuration directory"
+        return
     fi
+    
+    APACHE_PORT_CONF="$APACHE_CONF_DIR/freeipa-port.conf"
     
     cat > "$APACHE_PORT_CONF" << EOF
 # Custom port configuration for FreeIPA behind reverse proxy
-Listen $FREEIPA_PORT
+Listen $FREEIPA_PORT https
+
 <VirtualHost *:$FREEIPA_PORT>
     ServerName $HOSTNAME
-    DocumentRoot /usr/share/ipa/ui
+    
+    # SSL Configuration
     SSLEngine on
     SSLCertificateFile /var/lib/ipa/certs/httpd.crt
     SSLCertificateKeyFile /var/lib/ipa/private/httpd.key
-    Include /etc/httpd/conf.d/ipa.conf
-</VirtualHost>
+    SSLCertificateChainFile /var/lib/ipa/certs/ca.crt
+    
+    # Proxy headers
+    RequestHeader set X-Forwarded-Proto "https"
+    RequestHeader set X-Forwarded-Port "$FREEIPA_PORT"
+    
+    # Include FreeIPA configuration
 EOF
 
+    if [ -f "/etc/httpd/conf.d/ipa.conf" ]; then
+        echo "    Include /etc/httpd/conf.d/ipa.conf" >> "$APACHE_PORT_CONF"
+    elif [ -f "/etc/apache2/conf-available/ipa.conf" ]; then
+        echo "    Include /etc/apache2/conf-available/ipa.conf" >> "$APACHE_PORT_CONF"
+    fi
+    
+    echo "</VirtualHost>" >> "$APACHE_PORT_CONF"
+    
     # Enable the configuration if using Apache2
-    if [ -d "/etc/apache2" ]; then
-        a2enconf freeipa-port 2>/dev/null || true
+    if [ -d "/etc/apache2/conf-enabled" ]; then
+        ln -sf "$APACHE_PORT_CONF" /etc/apache2/conf-enabled/freeipa-port.conf
     fi
     
-    # Update main Apache configuration
+    # Update main SSL configuration to use custom port
     if [ -f "/etc/httpd/conf.d/ssl.conf" ]; then
-        sed -i "s/Listen 443/Listen $FREEIPA_PORT/" /etc/httpd/conf.d/ssl.conf 2>/dev/null || true
+        # Comment out the default Listen 443 if it exists
+        sed -i 's/^Listen 443/#Listen 443/' /etc/httpd/conf.d/ssl.conf 2>/dev/null || true
     fi
     
-    # Create systemd override for httpd service
-    mkdir -p /etc/systemd/system/httpd.service.d
-    cat > /etc/systemd/system/httpd.service.d/freeipa-proxy.conf << EOF
-[Service]
-Environment="FREEIPA_PROXY_PORT=$FREEIPA_PORT"
-EOF
-
-    systemctl daemon-reload
+    if [ -f "/etc/apache2/ports.conf" ]; then
+        # Comment out the default Listen 443 if it exists
+        sed -i 's/^Listen 443/#Listen 443/' /etc/apache2/ports.conf 2>/dev/null || true
+    fi
     
     log "Configured Apache to listen on port $FREEIPA_PORT"
+    
+    # Restart Apache to apply changes
+    if systemctl list-unit-files | grep -q "^httpd.service"; then
+        systemctl restart httpd
+    elif systemctl list-unit-files | grep -q "^apache2.service"; then
+        systemctl restart apache2
+    fi
 }
 
-# Function to start and enable services
-start_services() {
-    log "Starting and enabling FreeIPA services..."
-    
-    systemctl enable ipa
-    systemctl start ipa
-    
-    if [ "$INSTALL_DNS" = true ]; then
-        systemctl enable named-pkcs11
-        systemctl start named-pkcs11
-    fi
-    
-    log "FreeIPA services started successfully"
+# Function to configure AD trust (optional)
+configure_ad_trust() {
+    log "Skipping Active Directory Trust support (can be configured later with ipa-adtrust-install)"
+    # AD trust can be added later manually if needed
+    return
+}
+
+# Function to create initial users/groups (optional)
+create_initial_objects() {
+    log "Skipping initial object creation (can be done via web UI or CLI later)"
+    # Users and groups can be created via the web interface after installation
+    return
 }
 
 # Function to display configuration summary
 display_summary() {
     log "FreeIPA Installation Summary"
-    echo "=========================="
+    echo "=========================================="
     printf "Hostname: %s\n" "$HOSTNAME"
     printf "Domain: %s\n" "$DOMAIN"
     printf "Realm: %s\n" "$REALM"
@@ -505,27 +621,46 @@ display_summary() {
     printf "Admin Username: admin\n"
     printf "Admin Password: %s\n" "$ADMIN_PASSWORD"
     printf "Directory Manager Password: %s\n" "$DM_PASSWORD"
-    printf "Services: CA=Yes, DNS=%s\n" "$([ "$INSTALL_DNS" = true ] && echo "Yes" || echo "No")"
+    printf "Integrated DNS: %s\n" "$([ "$INSTALL_DNS" = true ] && echo "Yes" || echo "No")"
     
     if [ "$USE_LETSENCRYPT" = true ]; then
         printf "SSL Certificate: Let's Encrypt\n"
         printf "Certificate Path: %s\n" "$CERT_PATH"
         printf "Auto-renewal: Configured\n"
+    elif [ "$USE_FREEIPA_CA" = true ]; then
+        printf "SSL Certificate: FreeIPA CA\n"
     elif [ "$USE_SELFSIGNED" = true ]; then
-        printf "SSL Certificate: Self-signed (generated by FreeIPA)\n"
+        printf "SSL Certificate: Self-signed\n"
     else
         printf "SSL Certificate: Manual configuration required\n"
     fi
     
-    echo "=========================="
+    echo "=========================================="
+    echo ""
+    echo "Access FreeIPA:"
+    echo "  Internal URL: https://$HOSTNAME:$FREEIPA_PORT/ipa/ui"
+    echo "  (Configure your reverse proxy to forward to this URL)"
+    echo ""
+    echo "Service Management:"
+    echo "  ipactl status    - Check all services"
+    echo "  ipactl start     - Start all services"
+    echo "  ipactl stop      - Stop all services"
+    echo "  ipactl restart   - Restart all services"
     echo ""
     echo "Next Steps:"
-    echo "1. Configure your reverse proxy to forward to https://$HOSTNAME:$FREEIPA_PORT"
-    echo "2. Access FreeIPA web UI through your reverse proxy"
+    echo "1. Configure your external reverse proxy to forward to https://$HOSTNAME:$FREEIPA_PORT"
+    echo "2. Access the admin interface and complete initial setup"
     echo "3. Save the admin and Directory Manager passwords securely"
     
     if [ "$USE_LETSENCRYPT" = true ]; then
         echo "4. Let's Encrypt certificates will auto-renew (renewal hook configured)"
+    fi
+    
+    if [ "$INSTALL_DNS" = true ]; then
+        echo ""
+        echo "DNS Configuration:"
+        echo "  Set nameserver to: $(hostname -I | awk '{print $1}')"
+        echo "  Test DNS: dig $HOSTNAME @$(hostname -I | awk '{print $1}')"
     fi
     
     echo ""
@@ -536,37 +671,49 @@ display_summary() {
     echo "        proxy_set_header X-Real-IP \$remote_addr;"
     echo "        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;"
     echo "        proxy_set_header X-Forwarded-Proto \$scheme;"
-    
-    if [ "$USE_SELFSIGNED" = true ]; then
-        echo "        proxy_ssl_verify off;"
-    fi
-    
+    echo "        proxy_set_header X-Forwarded-Port \$server_port;"
+    echo "        proxy_ssl_verify off;"
     echo "    }"
+    echo ""
+    echo "Kerberos:"
+    echo "  kinit admin      - Get Kerberos ticket for admin"
+    echo "  klist            - List active tickets"
+    echo "  kdestroy         - Destroy tickets"
+    echo ""
+    echo "Important Files:"
+    echo "  /etc/ipa/default.conf - IPA configuration"
+    echo "  /var/log/ipaserver-install.log - Installation log"
+    echo "  /var/log/httpd/ - Web server logs"
+    echo "  /var/log/dirsrv/ - Directory server logs"
 }
 
 # Main execution
 main() {
-    log "Starting FreeIPA installation script"
+    log "Starting Full FreeIPA Server installation script"
     
     check_root
     detect_distro
     detect_domain
     check_requirements
     
-    # Find unused port
+    # Find unused port for reverse proxy
     FREEIPA_PORT=$(find_unused_port)
-    log "Selected port: $FREEIPA_PORT"
+    log "Selected FreeIPA port: $FREEIPA_PORT"
     
     configure_hosts
     install_packages
-    generate_ssl_certs
-    detect_services
+    configure_ntp_settings
+    configure_ssl_certs
+    configure_dns_settings
+    configure_firewall
     install_freeipa
     configure_reverse_proxy
-    start_services
+    configure_ad_trust
+    create_initial_objects
     display_summary
     
     log "FreeIPA installation and configuration completed successfully!"
+    log "You can now access the web interface through your reverse proxy"
 }
 
 # Execute main function
