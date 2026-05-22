@@ -1027,7 +1027,7 @@ services:
       KC_DB_USERNAME: keycloak
       KC_DB_PASSWORD: "${INSTALL_KEYCLOAK_DB_PASSWORD}"
       KC_HTTP_ENABLED: "true"
-      KC_HTTP_PORT: "8080"
+      KC_HTTP_PORT: "${INSTALL_KEYCLOAK_PORT}"
       KC_HOSTNAME_STRICT: "false"
       KC_PROXY: edge
       KC_TRUSTSTORE_PATHS: /etc/keycloak/ipa-ca.crt
@@ -1041,7 +1041,7 @@ services:
       - "/etc/krb5.conf:/etc/krb5.conf:ro"
       - keycloak_data:/opt/keycloak/data
     ports:
-      - "172.17.0.1:${INSTALL_KEYCLOAK_PORT}:8080"
+      - "172.17.0.1:${INSTALL_KEYCLOAK_PORT}:${INSTALL_KEYCLOAK_PORT}"
     depends_on:
       postgres:
         condition: service_healthy
@@ -1055,7 +1055,7 @@ services:
         max-size: "50m"
         max-file: "3"
     healthcheck:
-      test: ["CMD-SHELL", "curl -sf http://localhost:8080/health/ready || exit 1"]
+      test: ["CMD-SHELL", "curl -sf http://localhost:${INSTALL_KEYCLOAK_PORT}/health/ready || exit 1"]
       interval: 30s
       timeout: 10s
       retries: 10
