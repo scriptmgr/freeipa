@@ -83,7 +83,11 @@ INSTALL_LDIF_TMP=""
 
 __random_password() {
   local length="${1:-32}"
-  \tr -dc 'A-Za-z0-9!@#$%^&*_+-' </dev/urandom | \head -c "${length}"
+  # tr reads /dev/urandom infinitely; head closes the pipe after N bytes, sending
+  # SIGPIPE to tr. Run tr in a subshell and absorb the SIGPIPE with || true so
+  # set -o pipefail does not propagate tr's exit 141 to the caller.
+  ( \tr -dc 'A-Za-z0-9!@#$%^&*_+-' </dev/urandom 2>/dev/null || true ) | \head -c "${length}"
+  printf '\n'
 }
 
 __random_port() {
@@ -125,7 +129,7 @@ __load_credential() {
   local key="${2:?}"
   [[ -f "${file}" ]] || return 1
   local val
-  val="$(\grep -- "^${key}=" "${file}" | \tail -n1 | \cut -d= -f2-)"
+  val="$(\grep -- "^${key}=" "${file}" | \tail -n1 | \cut -d= -f2- || true)"
   [[ -n "${val}" ]] || return 1
   printf '%s\n' "${val}"
 }
@@ -232,7 +236,7 @@ __check_requirements() {
   __log "Checking system requirements..."
 
   local mem_kb mem_gb disk_avail disk_gb
-  mem_kb="$(\grep -- "MemTotal" /proc/meminfo | \awk '{print $2}')"
+  mem_kb="$(\grep -- "MemTotal" /proc/meminfo | \awk '{print $2}' || true)"
   mem_gb=$(( mem_kb / 1024 / 1024 ))
 
   if [[ "${mem_gb}" -lt 2 ]]; then
@@ -241,7 +245,7 @@ __check_requirements() {
     __warn "System has less than 4 GB RAM (${mem_gb} GB). 4 GB+ recommended for full features."
   fi
 
-  disk_avail="$(\df / | \tail -1 | \awk '{print $4}')"
+  disk_avail="$(\df / | \tail -1 | \awk '{print $4}' || true)"
   disk_gb=$(( disk_avail / 1024 / 1024 ))
 
   if [[ "${disk_gb}" -lt 10 ]]; then
@@ -366,7 +370,7 @@ __configure_hosts() {
   __log "Configuring /etc/hosts..."
 
   local primary_ip short_hostname
-  primary_ip="$(\hostname -I | \awk '{print $1}')"
+  primary_ip="$(\hostname -I | \awk '{print $1}' || true)"
   if [[ -z "${primary_ip}" ]]; then
     __warn "Could not detect primary IP address; falling back to 127.0.0.1"
     primary_ip="127.0.0.1"
@@ -503,8 +507,21 @@ __configure_dns_settings() {
   if ! \nslookup "${INSTALL_FQDN}" >/dev/null 2>&1; then
     __log "Hostname not resolvable via DNS; will install integrated DNS server"
     INSTALL_DNS="true"
-    INSTALL_USE_AUTO_FORWARDERS="true"
     INSTALL_CONFIGURE_REVERSE_ZONE="true"
+    # Extract only IPv4 nameservers from resolv.conf — skip IPv6 link-local
+    # (fe80::) and pure IPv6 addresses; ipa-server-install check_forwarders
+    # times out trying to validate link-local addresses from inside the container
+    local _ns _ipv4_fwds=""
+    while IFS= read -r _ns; do
+      _ipv4_fwds="${_ipv4_fwds:+${_ipv4_fwds} }${_ns}"
+    done < <(\grep -E '^nameserver[[:space:]]+[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' /etc/resolv.conf | \awk '{print $2}')
+    if [[ -n "${_ipv4_fwds}" ]]; then
+      __log "Using IPv4 DNS forwarders: ${_ipv4_fwds}"
+      INSTALL_DNS_FORWARDERS="${_ipv4_fwds}"
+    else
+      __log "No IPv4 DNS forwarders found; integrated DNS will run without forwarders"
+    fi
+    INSTALL_USE_AUTO_FORWARDERS="false"
   else
     __log "Hostname is resolvable; integrated DNS not required"
     INSTALL_DNS="false"
@@ -526,14 +543,20 @@ __configure_dns_settings() {
 __configure_ntp_settings() {
   __log "Configuring NTP/Chrony..."
 
-  if \systemctl list-unit-files | \grep -q -- "chronyd"; then
-    \systemctl enable chronyd
-    \systemctl start chronyd
-    __log "Chrony (chronyd) service enabled and started"
-  elif \systemctl list-unit-files | \grep -q -- "chrony"; then
-    \systemctl enable chrony
-    \systemctl start chrony
-    __log "Chrony service enabled and started"
+  # Find the exact unit name (chronyd.service on RHEL, chrony.service on Debian)
+  # Match ^chrony[^-] to exclude chrony-wait.service and chronyd-restricted.service
+  local chrony_unit
+  chrony_unit="$(\systemctl list-unit-files 2>/dev/null | \awk '$1 ~ /^chronyd?\.service$/{print $1; exit}' || true)"
+
+  if [[ -n "${chrony_unit}" ]]; then
+    # enable is best-effort — may be masked in containers
+    \systemctl enable "${chrony_unit}" 2>/dev/null || true
+    # start requires CAP_SYS_TIME — non-fatal in containers
+    if ! \systemctl start "${chrony_unit}" 2>/dev/null; then
+      __warn "${chrony_unit} could not start (no CAP_SYS_TIME? running in container); continuing"
+    else
+      __log "${chrony_unit} enabled and started"
+    fi
   else
     __warn "Chrony service not found; skipping NTP configuration"
   fi
@@ -643,6 +666,19 @@ EOF
 # ─── FreeIPA installation ────────────────────────────────────────────────────
 
 __install_freeipa() {
+  # Idempotency guard — skip if FreeIPA is already installed
+  if [[ -f "/etc/ipa/default.conf" ]]; then
+    __log "FreeIPA already installed (/etc/ipa/default.conf exists); skipping ipa-server-install"
+    # Still load credentials so downstream functions have them
+    INSTALL_ADMIN_PASSWORD="$(__load_credential "${INSTALL_CRED_FILE}" INSTALL_ADMIN_PASSWORD)" || {
+      __warn "FreeIPA installed but admin password not found in ${INSTALL_CRED_FILE}"
+    }
+    INSTALL_DM_PASSWORD="$(__load_credential "${INSTALL_CRED_FILE}" INSTALL_DM_PASSWORD)" || {
+      __warn "FreeIPA installed but DM password not found in ${INSTALL_CRED_FILE}"
+    }
+    return 0
+  fi
+
   __log "Starting FreeIPA server installation..."
 
   # Load or generate admin password
@@ -717,62 +753,65 @@ __configure_reverse_proxy() {
   __log "Configuring FreeIPA for reverse proxy setup..."
 
   local apache_conf_dir=""
+  local ssl_conf="" rewrite_conf=""
   if [[ -d "/etc/httpd/conf.d" ]]; then
     apache_conf_dir="/etc/httpd/conf.d"
+    ssl_conf="/etc/httpd/conf.d/ssl.conf"
+    rewrite_conf="/etc/httpd/conf.d/ipa-rewrite.conf"
   elif [[ -d "/etc/apache2/conf-available" ]]; then
     apache_conf_dir="/etc/apache2/conf-available"
+    ssl_conf="/etc/apache2/conf-available/ssl.conf"
+    rewrite_conf="/etc/apache2/conf-available/ipa-rewrite.conf"
   else
     __warn "Could not find Apache configuration directory; skipping reverse proxy config"
     return
   fi
 
+  # Step 1: Write a minimal port-only config — just adds a Listen directive.
+  # Do NOT create a duplicate VirtualHost; ipa.conf contains server-scope
+  # directives (WSGISocketPrefix etc.) that cannot live inside <VirtualHost>.
+  # The existing ssl.conf VirtualHost is extended below to also accept PORT.
   local apache_port_conf="${apache_conf_dir}/freeipa-port.conf"
-
   \cat > "${apache_port_conf}" << EOF
-# Custom port configuration for FreeIPA behind reverse proxy
+# FreeIPA custom port for reverse proxy — managed by install.sh
+# Adds a second Listen so the ssl.conf VirtualHost also accepts INSTALL_FREEIPA_PORT.
 Listen ${INSTALL_FREEIPA_PORT} https
-
-<VirtualHost *:${INSTALL_FREEIPA_PORT}>
-    ServerName ${INSTALL_FQDN}
-
-    SSLEngine on
-    SSLCertificateFile /var/lib/ipa/certs/httpd.crt
-    SSLCertificateKeyFile /var/lib/ipa/private/httpd.key
-    SSLCertificateChainFile /var/lib/ipa/certs/ca.crt
-
-    RequestHeader set X-Forwarded-Proto "https"
-    RequestHeader set X-Forwarded-Port "${INSTALL_FREEIPA_PORT}"
-
-    # Include FreeIPA vhost configuration
 EOF
-
-  if [[ -f "/etc/httpd/conf.d/ipa.conf" ]]; then
-    printf '    Include /etc/httpd/conf.d/ipa.conf\n' >> "${apache_port_conf}"
-  elif [[ -f "/etc/apache2/conf-available/ipa.conf" ]]; then
-    printf '    Include /etc/apache2/conf-available/ipa.conf\n' >> "${apache_port_conf}"
-  fi
-
-  printf '</VirtualHost>\n' >> "${apache_port_conf}"
 
   # Enable the configuration if using Apache2's conf-enabled mechanism
   if [[ -d "/etc/apache2/conf-enabled" ]]; then
     \ln -sf "${apache_port_conf}" /etc/apache2/conf-enabled/freeipa-port.conf
   fi
 
-  # Comment out the default Listen 443 from ssl.conf if present
-  if [[ -f "/etc/httpd/conf.d/ssl.conf" ]]; then
-    \sed -i 's/^Listen 443/#Listen 443/' /etc/httpd/conf.d/ssl.conf 2>/dev/null || true
+  # Step 2: Extend the existing SSL VirtualHost to also accept INSTALL_FREEIPA_PORT.
+  # ssl.conf has <VirtualHost _default_:443> — change it to accept both ports.
+  # This avoids duplicating any of the WSGI/SSL directives.
+  if [[ -f "${ssl_conf}" ]]; then
+    \sed -i "s|<VirtualHost _default_:443>|<VirtualHost _default_:443 _default_:${INSTALL_FREEIPA_PORT}>|" \
+      "${ssl_conf}" 2>/dev/null || true
+    __log "Extended ssl.conf VirtualHost to also listen on port ${INSTALL_FREEIPA_PORT}"
   fi
 
-  if [[ -f "/etc/apache2/ports.conf" ]]; then
-    \sed -i 's/^Listen 443/#Listen 443/' /etc/apache2/ports.conf 2>/dev/null || true
+  # Step 3: Patch ipa-rewrite.conf so it does not redirect requests arriving on
+  # INSTALL_FREEIPA_PORT back to port 443 (which would cause infinite redirect
+  # loops when nginx proxies to our custom port).
+  if [[ -f "${rewrite_conf}" ]]; then
+    # Insert an extra RewriteCond to exclude our custom port, immediately after
+    # the existing !^443$ condition line.
+    if ! \grep -q "!^${INSTALL_FREEIPA_PORT}\$" "${rewrite_conf}" 2>/dev/null; then
+      \sed -i "/RewriteCond %{SERVER_PORT}[[:space:]]*!\^443\\\$/a RewriteCond %{SERVER_PORT}  !^${INSTALL_FREEIPA_PORT}$" \
+        "${rewrite_conf}" 2>/dev/null || true
+      __log "Patched ipa-rewrite.conf to skip redirect for port ${INSTALL_FREEIPA_PORT}"
+    fi
   fi
 
   __log "Configured Apache to listen on port ${INSTALL_FREEIPA_PORT}"
 
-  if \systemctl list-unit-files | \grep -q -- "^httpd.service"; then
+  local _web_units
+  _web_units="$(\systemctl list-unit-files 2>/dev/null | \awk '{print $1}' || true)"
+  if printf '%s\n' "${_web_units}" | \grep -q -- "^httpd.service$"; then
     \systemctl restart httpd
-  elif \systemctl list-unit-files | \grep -q -- "^apache2.service"; then
+  elif printf '%s\n' "${_web_units}" | \grep -q -- "^apache2.service$"; then
     \systemctl restart apache2
   fi
 }
@@ -920,7 +959,8 @@ __setup_freeipa_for_keycloak() {
     printf 'nsIdleTimeout: 0\n'
   } > "${INSTALL_LDIF_TMP}"
 
-  \ldapadd -Y GSSAPI -H "ldap://localhost" -f "${INSTALL_LDIF_TMP}" || true
+  # Use FQDN — not localhost — so Kerberos resolves ldap/{FQDN}@REALM correctly
+  \ldapadd -Y GSSAPI -H "ldap://${INSTALL_FQDN}" -f "${INSTALL_LDIF_TMP}" || true
 
   # Remove LDIF immediately — it contained a cleartext password
   \rm -f "${INSTALL_LDIF_TMP}"
@@ -960,6 +1000,17 @@ __compose() {
 # ─── Keycloak Docker deployment ──────────────────────────────────────────────
 
 __install_keycloak_docker() {
+  # Idempotency guard — if Keycloak container is already running, just ensure
+  # credentials are loaded and skip docker-compose regeneration.
+  if \docker inspect keycloak >/dev/null 2>&1; then
+    __log "Keycloak container already exists; loading credentials and skipping redeploy"
+    INSTALL_KEYCLOAK_ADMIN_PASSWORD="$(__load_credential "${INSTALL_CRED_FILE}" INSTALL_KEYCLOAK_ADMIN_PASSWORD)" || {
+      __warn "Keycloak running but admin password not in ${INSTALL_CRED_FILE}"
+    }
+    INSTALL_KEYCLOAK_DB_PASSWORD="$(__load_credential "${INSTALL_CRED_FILE}" INSTALL_KEYCLOAK_DB_PASSWORD)" || true
+    return 0
+  fi
+
   __log "Deploying Keycloak via Docker Compose..."
 
   # Load or generate Keycloak admin password
@@ -981,7 +1032,7 @@ __install_keycloak_docker() {
   }
 
   local primary_ip
-  primary_ip="$(\hostname -I | \awk '{print $1}')"
+  primary_ip="$(\hostname -I | \awk '{print $1}' || true)"
 
   \mkdir -p "${INSTALL_COMPOSE_DIR}"
 
@@ -1086,7 +1137,13 @@ __wait_for_keycloak() {
   __log "Waiting for Keycloak to become ready (up to 300 s)..."
   local elapsed=0
   while [[ "${elapsed}" -lt 300 ]]; do
-    if \curl -q -LSs --max-time 5 "http://172.17.0.1:${INSTALL_KEYCLOAK_PORT}/health/ready" >/dev/null 2>&1; then
+    # Use the OIDC discovery document as the readiness probe — it is served only
+    # after Keycloak's HTTP servlet is fully initialised and the master realm
+    # exists. The /health/ready path returns 404 on the main port in KC 26
+    # (health lives on the management port 9000 which is not host-bound here).
+    if \curl -q -LSs --max-time 5 \
+        "http://172.17.0.1:${INSTALL_KEYCLOAK_PORT}/realms/master/.well-known/openid-configuration" \
+        2>/dev/null | \grep -q '"issuer"'; then
       __log "Keycloak is ready"
       return 0
     fi
@@ -1104,14 +1161,27 @@ __wait_for_keycloak() {
 
 __keycloak_admin_token() {
   local kc_url="http://172.17.0.1:${INSTALL_KEYCLOAK_PORT}"
-  \curl -q -LSs --max-time 10 -X POST \
-    "${kc_url}/realms/master/protocol/openid-connect/token" \
-    -H "Content-Type: application/x-www-form-urlencoded" \
-    --data-urlencode "grant_type=password" \
-    --data-urlencode "client_id=admin-cli" \
-    --data-urlencode "username=admin" \
-    --data-urlencode "password=${INSTALL_KEYCLOAK_ADMIN_PASSWORD}" \
-    | \jq -r '.access_token'
+  local token attempt=0
+  # Retry up to 6 times (60 s total) — Keycloak may still be warming up its
+  # HTTP servlet even after the OIDC discovery probe passes.
+  while [[ "${attempt}" -lt 6 ]]; do
+    token="$(\curl -q -LSs --max-time 10 -X POST \
+      "${kc_url}/realms/master/protocol/openid-connect/token" \
+      -H "Content-Type: application/x-www-form-urlencoded" \
+      --data-urlencode "grant_type=password" \
+      --data-urlencode "client_id=admin-cli" \
+      --data-urlencode "username=admin" \
+      --data-urlencode "password=${INSTALL_KEYCLOAK_ADMIN_PASSWORD}" \
+      2>/dev/null | \jq -r '.access_token // empty' 2>/dev/null)"
+    if [[ -n "${token}" && "${token}" != "null" ]]; then
+      printf '%s\n' "${token}"
+      return 0
+    fi
+    attempt=$(( attempt + 1 ))
+    sleep 10
+  done
+  __error "Could not obtain Keycloak admin token after ${attempt} attempts"
+  return 1
 }
 
 # - - - - - - - - - - - - - - - - - - - - - - - - -
@@ -1124,19 +1194,35 @@ __configure_keycloak() {
   local kc_url="http://172.17.0.1:${INSTALL_KEYCLOAK_PORT}"
   local token
 
-  # Step 1 — Create realm
+  # Step 1 — Create realm (idempotent: skip if realm already exists)
   token="$(__keycloak_admin_token)"
-  \curl -q -LSs --max-time 10 -X POST \
-    "${kc_url}/admin/realms" \
+  local realm_exists
+  realm_exists="$(\curl -q -LSs --max-time 10 \
+    "${kc_url}/admin/realms/${INSTALL_KEYCLOAK_REALM}" \
     -H "Authorization: Bearer ${token}" \
-    -H "Content-Type: application/json" \
-    -d "$(\jq -n --arg r "${INSTALL_KEYCLOAK_REALM}" --arg d "${INSTALL_DOMAIN}" \
-      '{realm: $r, enabled: true, displayName: ("SSO — " + $d), sslRequired: "external", registrationAllowed: false, bruteForceProtected: true}')"
+    2>/dev/null | \jq -r '.realm // empty' 2>/dev/null)"
 
-  __log "Realm ${INSTALL_KEYCLOAK_REALM} created"
+  if [[ -z "${realm_exists}" ]]; then
+    token="$(__keycloak_admin_token)"
+    \curl -q -LSs --max-time 10 -X POST \
+      "${kc_url}/admin/realms" \
+      -H "Authorization: Bearer ${token}" \
+      -H "Content-Type: application/json" \
+      -d "$(\jq -n --arg r "${INSTALL_KEYCLOAK_REALM}" --arg d "${INSTALL_DOMAIN}" \
+        '{realm: $r, enabled: true, displayName: ("SSO — " + $d), sslRequired: "external", registrationAllowed: false, bruteForceProtected: true}')"
+    __log "Realm ${INSTALL_KEYCLOAK_REALM} created"
+  else
+    __log "Realm ${INSTALL_KEYCLOAK_REALM} already exists; skipping creation"
+  fi
 
-  # Step 2 — Create LDAP user federation component
+  # Step 2 — Create LDAP user federation component (idempotent — check first)
   token="$(__keycloak_admin_token)"
+
+  # Check if freeipa-ldap component already exists
+  local _existing_comp
+  _existing_comp="$(\curl -q -LSs --max-time 10 \
+    "${kc_url}/admin/realms/${INSTALL_KEYCLOAK_REALM}/components?type=org.keycloak.storage.UserStorageProvider&name=freeipa-ldap" \
+    -H "Authorization: Bearer ${token}" 2>/dev/null | \jq -r 'if type == "array" then .[0].id // empty else empty end' 2>/dev/null || true)"
 
   local ldap_body
   ldap_body="$(\jq -n \
@@ -1186,31 +1272,46 @@ __configure_keycloak() {
     }')"
 
   local ldap_response component_id
-  ldap_response="$(\curl -q -LSs --max-time 10 -X POST -D - \
-    "${kc_url}/admin/realms/${INSTALL_KEYCLOAK_REALM}/components" \
-    -H "Authorization: Bearer ${token}" \
-    -H "Content-Type: application/json" \
-    -d "${ldap_body}")"
-  component_id="$(printf '%s\n' "${ldap_response}" | \grep -i -- "^[Ll]ocation:" | \sed 's|.*/||' | \tr -d '\r\n')"
+  if [[ -n "${_existing_comp}" && "${_existing_comp}" != "null" ]]; then
+    component_id="${_existing_comp}"
+    __log "LDAP federation component already exists (id: ${component_id}); skipping creation"
+  else
+    ldap_response="$(\curl -q -LSs --max-time 10 -X POST -D - \
+      "${kc_url}/admin/realms/${INSTALL_KEYCLOAK_REALM}/components" \
+      -H "Authorization: Bearer ${token}" \
+      -H "Content-Type: application/json" \
+      -d "${ldap_body}")"
+    component_id="$(printf '%s\n' "${ldap_response}" | \grep -i -- "^[Ll]ocation:" | \sed 's|.*/||' | \tr -d '\r\n')"
+    __log "LDAP federation component created (id: ${component_id})"
+  fi
 
-  __log "LDAP federation component created (id: ${component_id})"
+  if [[ -z "${component_id}" ]]; then
+    __warn "Could not get LDAP federation component ID; skipping sync and role setup"
+    return 0
+  fi
 
   # Step 3 — Trigger full LDAP sync
   \curl -q -LSs --max-time 30 -X POST \
     "${kc_url}/admin/realms/${INSTALL_KEYCLOAK_REALM}/user-storage/${component_id}/sync?action=triggerFullSync" \
-    -H "Authorization: Bearer ${token}" >/dev/null
+    -H "Authorization: Bearer ${token}" >/dev/null 2>/dev/null || true
 
   __log "LDAP full sync triggered"
 
   # Step 4 — Wait for admin user to appear after sync (up to 60 s)
+  # Refresh token — previous one may be stale after sync wait
   token="$(__keycloak_admin_token)"
   local admin_user_id="" attempt=0
   while [[ -z "${admin_user_id}" || "${admin_user_id}" == "null" ]] && [[ "${attempt}" -lt 12 ]]; do
     sleep 5
-    admin_user_id="$(\curl -q -LSs --max-time 10 \
+    # Refresh token every 3 attempts to avoid 401
+    if [[ $(( attempt % 3 )) -eq 0 ]]; then
+      token="$(__keycloak_admin_token)" || true
+    fi
+    local _users_resp
+    _users_resp="$(\curl -q -LSs --max-time 10 \
       "${kc_url}/admin/realms/${INSTALL_KEYCLOAK_REALM}/users?username=admin&exact=true" \
-      -H "Authorization: Bearer ${token}" \
-      | \jq -r '.[0].id // empty')"
+      -H "Authorization: Bearer ${token}" 2>/dev/null)"
+    admin_user_id="$(printf '%s\n' "${_users_resp}" | \jq -r 'if type == "array" then .[0].id // empty else empty end' 2>/dev/null || true)"
     attempt=$(( attempt + 1 ))
   done
 
@@ -1221,27 +1322,40 @@ __configure_keycloak() {
 
   # Step 5 — Assign realm-admin role to admin user
 
+  # Refresh token before role assignment
+  token="$(__keycloak_admin_token)" || true
+
   # Get realm-management client ID
-  local rm_client_id
-  rm_client_id="$(\curl -q -LSs --max-time 10 \
+  local rm_client_id _clients_resp
+  _clients_resp="$(\curl -q -LSs --max-time 10 \
     "${kc_url}/admin/realms/${INSTALL_KEYCLOAK_REALM}/clients?clientId=realm-management" \
-    -H "Authorization: Bearer ${token}" \
-    | \jq -r '.[0].id')"
+    -H "Authorization: Bearer ${token}" 2>/dev/null)"
+  rm_client_id="$(printf '%s\n' "${_clients_resp}" | \jq -r 'if type == "array" then .[0].id // empty else empty end' 2>/dev/null || true)"
+
+  if [[ -z "${rm_client_id}" || "${rm_client_id}" == "null" ]]; then
+    __warn "Could not find realm-management client — skipping realm-admin role assignment"
+    return 0
+  fi
 
   # Get realm-admin role details
   local role_info role_id role_name
   role_info="$(\curl -q -LSs --max-time 10 \
     "${kc_url}/admin/realms/${INSTALL_KEYCLOAK_REALM}/clients/${rm_client_id}/roles/realm-admin" \
-    -H "Authorization: Bearer ${token}")"
-  role_id="$(printf '%s\n' "${role_info}" | \jq -r '.id')"
-  role_name="$(printf '%s\n' "${role_info}" | \jq -r '.name')"
+    -H "Authorization: Bearer ${token}" 2>/dev/null)"
+  role_id="$(printf '%s\n' "${role_info}" | \jq -r '.id // empty' 2>/dev/null || true)"
+  role_name="$(printf '%s\n' "${role_info}" | \jq -r '.name // empty' 2>/dev/null || true)"
+
+  if [[ -z "${role_id}" || "${role_id}" == "null" ]]; then
+    __warn "Could not find realm-admin role — skipping role assignment"
+    return 0
+  fi
 
   # Assign realm-admin role to the admin user
   \curl -q -LSs --max-time 10 -X POST \
     "${kc_url}/admin/realms/${INSTALL_KEYCLOAK_REALM}/users/${admin_user_id}/role-mappings/clients/${rm_client_id}" \
     -H "Authorization: Bearer ${token}" \
     -H "Content-Type: application/json" \
-    -d "[$(\jq -n --arg id "${role_id}" --arg name "${role_name}" '{id: $id, name: $name}')]" >/dev/null
+    -d "[$(\jq -n --arg id "${role_id}" --arg name "${role_name}" '{id: $id, name: $name}')]" >/dev/null 2>/dev/null || true
 
   __log "Keycloak realm configured. Admin promoted to realm-admin."
 }
@@ -1354,7 +1468,7 @@ __create_initial_objects() {
 
 __display_summary() {
   local primary_ip
-  primary_ip="$(\hostname -I | \awk '{print $1}')"
+  primary_ip="$(\hostname -I | \awk '{print $1}' || true)"
 
   __log "FreeIPA + Keycloak Installation Summary"
   printf '==========================================\n'
@@ -1497,12 +1611,18 @@ __main() {
   __detect_domain
   __check_requirements
 
-  # Load or pick a stable reverse-proxy port for this installation
+  # Load or pick stable ports for this installation — both must be set before __configure_firewall
   INSTALL_FREEIPA_PORT="$(__load_credential "${INSTALL_CRED_FILE}" INSTALL_FREEIPA_PORT)" || {
     INSTALL_FREEIPA_PORT="$(__random_port)"
     __save_credential "${INSTALL_CRED_FILE}" INSTALL_FREEIPA_PORT "${INSTALL_FREEIPA_PORT}"
   }
   __log "Selected FreeIPA port: ${INSTALL_FREEIPA_PORT}"
+
+  INSTALL_KEYCLOAK_PORT="$(__load_credential "${INSTALL_CRED_FILE}" INSTALL_KEYCLOAK_PORT)" || {
+    INSTALL_KEYCLOAK_PORT="$(__random_port)"
+    __save_credential "${INSTALL_CRED_FILE}" INSTALL_KEYCLOAK_PORT "${INSTALL_KEYCLOAK_PORT}"
+  }
+  __log "Selected Keycloak port: ${INSTALL_KEYCLOAK_PORT}"
 
   __install_prerequisites
   __configure_hosts
