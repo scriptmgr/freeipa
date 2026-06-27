@@ -574,6 +574,9 @@ __configure_firewall() {
     \systemctl enable firewalld
     \systemctl start firewalld
 
+    \firewall-cmd --permanent --add-service=ssh
+    \firewall-cmd --permanent --add-service=http
+    \firewall-cmd --permanent --add-service=https
     \firewall-cmd --permanent --add-service=freeipa-ldap
     \firewall-cmd --permanent --add-service=freeipa-ldaps
     \firewall-cmd --permanent --add-service=freeipa-replication
@@ -590,6 +593,11 @@ __configure_firewall() {
 
     # Keycloak port (internal Docker bridge — open for reverse proxy reach)
     \firewall-cmd --permanent --add-port="${INSTALL_KEYCLOAK_PORT}/tcp"
+    # Mosh server uses UDP 60000-61000 for encrypted remote terminal sessions
+    \firewall-cmd --permanent --add-port=60000-61000/udp
+    # Allow ICMP ping for monitoring
+    \firewall-cmd --permanent --remove-icmp-block=echo-request 2>/dev/null || true
+    \firewall-cmd --permanent --remove-icmp-block=echo-reply 2>/dev/null || true
 
     \firewall-cmd --reload
 
@@ -599,6 +607,11 @@ __configure_firewall() {
     __log "Detected UFW; configuring..."
     \ufw --force enable
 
+    # SSH
+    \ufw allow 22/tcp
+    # HTTP / HTTPS
+    \ufw allow 80/tcp
+    \ufw allow 443/tcp
     # Custom HTTPS port for the FreeIPA reverse proxy
     \ufw allow "${INSTALL_FREEIPA_PORT}/tcp"
     # LDAP
@@ -623,6 +636,12 @@ __configure_firewall() {
 
     # Keycloak port
     \ufw allow "${INSTALL_KEYCLOAK_PORT}/tcp"
+    # Mosh server uses UDP 60000-61000 for encrypted remote terminal sessions
+    \ufw allow 60000:61000/udp
+    # Allow ICMP ping — inject into before.rules if not already present
+    if [ -f /etc/ufw/before.rules ] && ! \grep -q "# ICMP ping allow" /etc/ufw/before.rules 2>/dev/null; then
+      \sed -i '/^COMMIT$/i # ICMP ping allow\n-A ufw-before-input -p icmp --icmp-type echo-request -j ACCEPT\n-A ufw-before-input -p icmp --icmp-type echo-reply -j ACCEPT' /etc/ufw/before.rules 2>/dev/null || true
+    fi
 
     __log "UFW configured"
   else
@@ -1106,7 +1125,7 @@ services:
         max-size: "50m"
         max-file: "3"
     healthcheck:
-      test: ["CMD-SHELL", "curl -sf http://localhost:${INSTALL_KEYCLOAK_PORT}/health/ready || exit 1"]
+      test: ["CMD-SHELL", "exec 3<>/dev/tcp/localhost/${INSTALL_KEYCLOAK_PORT} && printf 'GET /realms/master/.well-known/openid-configuration HTTP/1.0\\r\\nHost: localhost\\r\\n\\r\\n' >&3 && grep -q 'issuer' <&3"]
       interval: 30s
       timeout: 10s
       retries: 10
