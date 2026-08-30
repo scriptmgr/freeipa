@@ -172,6 +172,7 @@ __help() {
   printf '  FREEIPA_CA_SHA256        Expected SHA-256 fingerprint of the server'"'"'s CA cert\n'
   printf '                           (Alpine path only; obtain out-of-band with:\n'
   printf '                           openssl x509 -noout -fingerprint -sha256 -in /etc/ipa/ca.crt)\n'
+  printf '  FREEIPA_DEBUG            Enable debug output when set to 1 (same as --debug)\n'
   printf '  NO_COLOR                 Disable color output when set\n\n'
   printf 'Notes:\n'
   printf '  Alpine Linux has no ipa-client-install package, and musl libc cannot\n'

@@ -66,7 +66,10 @@ All steps are idempotent — re-running the script detects existing installs (Fr
 |----------|---------|---------|
 | `FREEIPA_FQDN` | auto-detected | Override the detected hostname |
 | `FREEIPA_DOMAIN` | auto-detected | Override the detected domain |
+| `FREEIPA_REALM` | auto-detected | Override the detected Kerberos realm |
+| `FREEIPA_PORT` | auto-detected | Override the detected reverse-proxy port |
 | `FREEIPA_CRED_FILE` | `/root/.freeipa-install.conf` | Generated-credentials file path |
+| `FREEIPA_DEBUG` | `0` | Enable debug output when set to `1` (same as `--debug`) |
 | `FREEIPA_KEYCLOAK_PORT` | random, 62000–64999 | Keycloak HTTP port |
 | `FREEIPA_KEYCLOAK_REALM` | domain name | Keycloak realm name |
 | `FREEIPA_COMPOSE_DIR` | `/opt/keycloak` | Docker Compose directory |
@@ -74,8 +77,7 @@ All steps are idempotent — re-running the script detects existing installs (Fr
 | `FREEIPA_MAIL_DOMAIN` | `FREEIPA_DOMAIN` | Mail domain for virtual mailboxes |
 | `FREEIPA_MAIL_BASE_DIR` | `/var/mail/vhosts` | Maildir storage root |
 | `FREEIPA_MAIL_VUSER` | `vmail` | System user/group owning mailbox storage |
-| `FREEIPA_MAIL_VUID` | `5000` | UID for `FREEIPA_MAIL_VUSER` |
-| `FREEIPA_MAIL_VGID` | `5000` | GID for `FREEIPA_MAIL_VUSER` |
+| `FREEIPA_MAIL_VID` | `5000` | UID and GID for `FREEIPA_MAIL_VUSER` (single ID shared by both) |
 | `FREEIPA_MAIL_LOCAL_FALLBACK` | `true` | Add a Unix/PAM passdb tried when a user isn't found in LDAP |
 | `FREEIPA_MAIL_KEYCLOAK_AUTH` | `true` | Add a Keycloak OAUTHBEARER/XOAUTH2 passdb (IMAP/POP3 only) |
 | `NO_COLOR` | unset | Disable color output when set |
@@ -155,6 +157,7 @@ authentication (not NSS-based lookups).
 | `FREEIPA_ADMIN_PASSWORD` | unset | Enrollment principal's password (prompted if unset) |
 | `FREEIPA_OTP` | unset | One-time host password — recommended over the admin password |
 | `FREEIPA_CA_SHA256` | unset | Expected CA cert SHA-256 fingerprint (Alpine path only) |
+| `FREEIPA_DEBUG` | `0` | Enable debug output when set to `1` (same as `--debug`) |
 | `NO_COLOR` | unset | Disable color output when set |
 
 ---

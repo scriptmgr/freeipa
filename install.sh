@@ -82,8 +82,7 @@ INSTALL_LDIF_TMP=""
 FREEIPA_MAIL_DOMAIN="${FREEIPA_MAIL_DOMAIN:-}"
 FREEIPA_MAIL_BASE_DIR="${FREEIPA_MAIL_BASE_DIR:-/var/mail/vhosts}"
 FREEIPA_MAIL_VUSER="${FREEIPA_MAIL_VUSER:-vmail}"
-FREEIPA_MAIL_VUID="${FREEIPA_MAIL_VUID:-5000}"
-FREEIPA_MAIL_VGID="${FREEIPA_MAIL_VGID:-5000}"
+FREEIPA_MAIL_VID="${FREEIPA_MAIL_VID:-5000}"
 INSTALL_MAIL_LDAP_PASSWORD=""
 INSTALL_MAIL_CERT_PATH=""
 INSTALL_MAIL_KEY_PATH=""
@@ -237,11 +236,21 @@ __help() {
   printf 'Environment:\n'
   printf '  FREEIPA_FQDN             Override auto-detected hostname\n'
   printf '  FREEIPA_DOMAIN           Override auto-detected domain\n'
+  printf '  FREEIPA_REALM            Override auto-detected Kerberos realm\n'
+  printf '  FREEIPA_PORT             Override auto-detected reverse-proxy port\n'
   printf '  FREEIPA_CRED_FILE        Credentials file path (default: /root/.freeipa-install.conf)\n'
+  printf '  FREEIPA_DEBUG            Enable debug output when set to 1 (same as --debug)\n'
   printf '  FREEIPA_KEYCLOAK_PORT    Override Keycloak port (default: random in 62000-64999)\n'
   printf '  FREEIPA_KEYCLOAK_REALM   Override Keycloak realm (default: domain name)\n'
   printf '  FREEIPA_COMPOSE_DIR      Docker Compose directory (default: /opt/keycloak)\n'
   printf '  FREEIPA_KEYCLOAK_CONFIG_DIR  Keycloak config directory (default: /etc/keycloak)\n'
+  printf '  FREEIPA_MAIL_DOMAIN      Mail domain for virtual mailboxes (default: FREEIPA_DOMAIN)\n'
+  printf '  FREEIPA_MAIL_BASE_DIR    Maildir storage root (default: /var/mail/vhosts)\n'
+  printf '  FREEIPA_MAIL_VUSER       System user/group owning mailbox storage (default: vmail)\n'
+  printf '  FREEIPA_MAIL_VID         UID/GID for FREEIPA_MAIL_VUSER (default: 5000)\n'
+  printf '  FREEIPA_MAIL_LOCAL_FALLBACK   Add a Unix/PAM passdb fallback (default: true)\n'
+  printf '  FREEIPA_MAIL_KEYCLOAK_AUTH    Add a Keycloak OAUTHBEARER passdb (default: true)\n'
+  printf '  FREEIPA_MAIL_KEYCLOAK_CLIENT_ID  Keycloak client ID for token introspection (default: dovecot-mail)\n'
   printf '  NO_COLOR                 Disable color output when set\n'
 }
 
@@ -1794,10 +1803,10 @@ __create_mail_storage() {
   __log "Preparing mail storage..."
 
   if ! \getent group "${FREEIPA_MAIL_VUSER}" >/dev/null 2>&1; then
-    \groupadd -g "${FREEIPA_MAIL_VGID}" "${FREEIPA_MAIL_VUSER}"
+    \groupadd -g "${FREEIPA_MAIL_VID}" "${FREEIPA_MAIL_VUSER}"
   fi
   if ! \getent passwd "${FREEIPA_MAIL_VUSER}" >/dev/null 2>&1; then
-    \useradd -r -u "${FREEIPA_MAIL_VUID}" -g "${FREEIPA_MAIL_VGID}" \
+    \useradd -r -u "${FREEIPA_MAIL_VID}" -g "${FREEIPA_MAIL_VID}" \
       -d "${FREEIPA_MAIL_BASE_DIR}" -s /usr/sbin/nologin "${FREEIPA_MAIL_VUSER}"
   fi
 
@@ -1879,8 +1888,8 @@ __configure_postfix() {
     printf 'virtual_mailbox_base = %s\n' "${FREEIPA_MAIL_BASE_DIR}"
     printf 'virtual_mailbox_maps = ldap:/etc/postfix/ldap/virtual-mailbox.cf\n'
     printf 'virtual_alias_maps = ldap:/etc/postfix/ldap/virtual-alias.cf\n'
-    printf 'virtual_uid_maps = static:%s\n' "${FREEIPA_MAIL_VUID}"
-    printf 'virtual_gid_maps = static:%s\n' "${FREEIPA_MAIL_VGID}"
+    printf 'virtual_uid_maps = static:%s\n' "${FREEIPA_MAIL_VID}"
+    printf 'virtual_gid_maps = static:%s\n' "${FREEIPA_MAIL_VID}"
     printf 'virtual_transport = lmtp:unix:private/dovecot-lmtp\n'
     printf 'smtpd_sasl_type = dovecot\n'
     printf 'smtpd_sasl_path = private/auth\n'
@@ -1967,7 +1976,7 @@ __configure_dovecot() {
     printf 'user_filter = (&(objectClass=posixAccount)(uid=%%n))\n'
     printf 'pass_filter = (&(objectClass=posixAccount)(uid=%%n))\n'
     printf 'user_attrs = =home=%s/%s/%%n,=uid=%s,=gid=%s\n' \
-      "${FREEIPA_MAIL_BASE_DIR}" "${FREEIPA_MAIL_DOMAIN}" "${FREEIPA_MAIL_VUID}" "${FREEIPA_MAIL_VGID}"
+      "${FREEIPA_MAIL_BASE_DIR}" "${FREEIPA_MAIL_DOMAIN}" "${FREEIPA_MAIL_VID}" "${FREEIPA_MAIL_VID}"
   } > /etc/dovecot/dovecot-ldap.conf.ext
   \chown root:dovecot /etc/dovecot/dovecot-ldap.conf.ext
   \chmod 640 /etc/dovecot/dovecot-ldap.conf.ext
