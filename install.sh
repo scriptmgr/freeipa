@@ -375,7 +375,7 @@ __detect_distro() {
     # shellcheck source=/dev/null
     . /etc/os-release
     INSTALL_DISTRO="${ID:-unknown}"
-    INSTALL_DISTRO_FAMILY="${ID_LIKE:-unknown}"
+    INSTALL_DISTRO_FAMILY="${ID_LIKE:-}"
     INSTALL_DISTRO_VERSION="${VERSION_ID:-unknown}"
   elif [[ -f /etc/redhat-release ]]; then
     INSTALL_DISTRO="rhel"
@@ -387,6 +387,20 @@ __detect_distro() {
     INSTALL_DISTRO_VERSION="unknown"
   else
     __error "Cannot detect distribution"
+  fi
+
+  # Base distros (Fedora, Debian) set no ID_LIKE at all — only derivatives
+  # (Alma/Rocky/CentOS, Ubuntu, openSUSE Leap/Tumbleweed) do. Fall back to
+  # mapping ID itself so package-manager case statements downstream still
+  # match instead of hitting "Unsupported distribution family: unknown".
+  if [[ -z "${INSTALL_DISTRO_FAMILY}" ]]; then
+    case "${INSTALL_DISTRO}" in
+      fedora) INSTALL_DISTRO_FAMILY="fedora" ;;
+      rhel|centos|almalinux|rocky) INSTALL_DISTRO_FAMILY="rhel fedora" ;;
+      debian) INSTALL_DISTRO_FAMILY="debian" ;;
+      opensuse*|sles) INSTALL_DISTRO_FAMILY="suse" ;;
+      *) INSTALL_DISTRO_FAMILY="unknown" ;;
+    esac
   fi
 
   __log "Detected distribution: ${INSTALL_DISTRO} ${INSTALL_DISTRO_VERSION} (family: ${INSTALL_DISTRO_FAMILY})"
@@ -444,7 +458,7 @@ __install_packages() {
   local pkg_mgr
 
   case "${INSTALL_DISTRO_FAMILY}" in
-    *rhel*|*fedora*|*centos*)
+    *rhel*|*centos*)
       if \command -v dnf >/dev/null 2>&1; then
         pkg_mgr="dnf"
       else
@@ -455,18 +469,35 @@ __install_packages() {
       "${pkg_mgr}" install -y ipa-server ipa-server-dns ipa-server-trust-ad bind-utils chrony firewalld openldap-clients
       ;;
 
-    *debian*|*ubuntu*)
-      __log "Installing FreeIPA packages via apt-get..."
-      local INSTALL_DEBIAN_FRONTEND="noninteractive"
-      export DEBIAN_FRONTEND="${INSTALL_DEBIAN_FRONTEND}"
-      \apt-get update
-      \apt-get install -y freeipa-server freeipa-server-dns freeipa-server-trust-ad bind9-utils dnsutils chrony ufw ldap-utils
+    # Fedora renamed the ipa-* packages to freeipa-* (RHEL/CentOS/Alma/Rocky
+    # kept the ipa-* names) — matched after *rhel*/*centos* since a real
+    # RHEL-like's family string ("rhel centos fedora") also contains "fedora".
+    *fedora*)
+      if \command -v dnf >/dev/null 2>&1; then
+        pkg_mgr="dnf"
+      else
+        pkg_mgr="yum"
+      fi
+      __log "Installing FreeIPA packages via ${pkg_mgr}..."
+      "${pkg_mgr}" update -y
+      "${pkg_mgr}" install -y freeipa-server freeipa-server-dns freeipa-server-trust-ad bind-utils chrony firewalld openldap-clients
       ;;
 
-    *suse*)
-      __log "Installing FreeIPA packages via zypper..."
-      \zypper refresh
-      \zypper install -y freeipa-server freeipa-server-dns freeipa-server-trust-ad bind-utils chrony firewalld openldap2-client
+    # No freeipa-server package exists for Debian/Ubuntu/openSUSE: verified
+    # empirically (Docker, 2026-08) — Debian's own experimental repo has no
+    # installable candidate, Ubuntu never shipped one (blocked upstream by a
+    # bind-dyndb-ldap/bind9 packaging conflict) and its only PPA has been dead
+    # since 2014, and openSUSE's security:idm OBS project ships freeipa-client
+    # only. The FreeIPA server role is RHEL-family and Fedora only; client.sh
+    # remains cross-distro and is unaffected.
+    *debian*|*ubuntu*|*suse*)
+      local unsupported_msg
+      unsupported_msg="FreeIPA server install is not supported on ${INSTALL_DISTRO}"
+      unsupported_msg+=" — no working freeipa-server package exists upstream for"
+      unsupported_msg+=" Debian/Ubuntu/openSUSE. Use RHEL-family"
+      unsupported_msg+=" (RHEL/CentOS/AlmaLinux/Rocky) or Fedora for the server"
+      unsupported_msg+=" role; client.sh supports this distro."
+      __error "${unsupported_msg}"
       ;;
 
     *)
@@ -1731,8 +1762,39 @@ EOF
 
 # ─── Post-install stubs ───────────────────────────────────────────────────────
 
+# AD trust support (ipa-adtrust-install) is enabled unconditionally as part of
+# setup — only RHEL-family and Fedora have a working freeipa-server package
+# (verified empirically; Debian/Ubuntu/openSUSE abort earlier in
+# __install_packages), so this never reaches ipa-adtrust-install on those.
 __configure_ad_trust() {
-  __log "AD trust skipped — run 'ipa-adtrust-install' manually if needed"
+  case "${INSTALL_DISTRO_FAMILY}" in
+    *rhel*|*centos*|*fedora*) ;;
+    *)
+      __log "AD trust setup (ipa-adtrust-install) is only supported on RHEL-family and Fedora; skipping on ${INSTALL_DISTRO}"
+      return 0
+      ;;
+  esac
+
+  # ipa-adtrust-install stores its config in the Samba registry (smb.conf just
+  # `include`s it), so "netbios name" shows up under `net conf list`, not in
+  # smb.conf itself. Its own docs warn re-running --add-sids on an
+  # already-trusted server can cause high replication traffic, so use that as
+  # the idempotency marker rather than re-running unconditionally
+  if \net conf list 2>/dev/null | \grep -q -- "netbios name"; then
+    __log "AD trust already configured (Samba registry has a netbios name); skipping ipa-adtrust-install"
+    return 0
+  fi
+
+  __log "Configuring AD trust support (ipa-adtrust-install)..."
+
+  printf '%s\n' "${INSTALL_ADMIN_PASSWORD}" | \kinit "admin@${FREEIPA_REALM}"
+
+  if ! \ipa-adtrust-install -U -a "${INSTALL_ADMIN_PASSWORD}" --add-sids; then
+    __warn "ipa-adtrust-install failed — AD trust support was not configured; run it manually if needed"
+    return 0
+  fi
+
+  __log "AD trust support configured"
 }
 
 __create_initial_objects() {

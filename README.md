@@ -25,7 +25,7 @@ bash install.sh
 
 ### What it does
 
-1. **Detects your distro family** — RHEL/Fedora/CentOS, Debian/Ubuntu, or openSUSE
+1. **Detects your distro family** — RHEL/Fedora/CentOS (see [Supported distributions](#supported-distributions))
 2. **Checks requirements** — 2 GB+ RAM (4 GB+ recommended), 10 GB+ free disk, valid FQDN
 3. **Installs prerequisites** — Docker CE and `jq`, skipped if already present
 4. **Configures `/etc/hosts`, NTP/Chrony, and DNS forwarders** automatically
@@ -37,18 +37,29 @@ bash install.sh
 10. **Deploys Keycloak via Docker Compose** — Postgres + Keycloak, with Kerberos SPNEGO wired to FreeIPA
 11. **Configures the Keycloak realm over its REST API** — creates the realm, the LDAP user federation component, triggers a full sync, and promotes the admin user to `realm-admin`
 12. **Writes an nginx vhost for Keycloak**, if nginx is installed
-13. **Installs and configures Postfix and Dovecot** — LDAP-authenticated virtual mailboxes backed by FreeIPA, with an IPA-issued, certmonger-tracked TLS certificate shared by both. Postfix accepts mail for `FREEIPA_MAIL_DOMAIN` and any `*.FREEIPA_MAIL_DOMAIN` subdomain (via a `regexp:` virtual-domain map — Postfix has no native glob syntax). Dovecot also supports a Unix/PAM local-account fallback (tried when a user isn't found in LDAP) and Keycloak OAUTHBEARER/XOAUTH2 via token introspection for IMAP/POP3 clients that support it — both on by default, each independently toggleable
-14. Prints an installation summary with access URLs, credential locations, and next steps
+13. **Configures AD trust support** (`ipa-adtrust-install --add-sids`), unconditionally — RHEL-family and Fedora only, since no working `freeipa-server` package exists for Debian/Ubuntu/openSUSE (see [Supported distributions](#supported-distributions))
+14. **Installs and configures Postfix and Dovecot** — LDAP-authenticated virtual mailboxes backed by FreeIPA, with an IPA-issued, certmonger-tracked TLS certificate shared by both. Postfix accepts mail for `FREEIPA_MAIL_DOMAIN` and any `*.FREEIPA_MAIL_DOMAIN` subdomain (via a `regexp:` virtual-domain map — Postfix has no native glob syntax). Dovecot also supports a Unix/PAM local-account fallback (tried when a user isn't found in LDAP) and Keycloak OAUTHBEARER/XOAUTH2 via token introspection for IMAP/POP3 clients that support it — both on by default, each independently toggleable
+15. Prints an installation summary with access URLs, credential locations, and next steps
 
 All steps are idempotent — re-running the script detects existing installs (FreeIPA, the Keycloak container, generated credentials) and skips them.
 
 ### Supported distributions
 
+The FreeIPA **server** role only runs on RHEL-family and Fedora — verified empirically
+(Docker testing, 2026-08): Debian bookworm has no installable `freeipa-server`
+candidate even via its own `experimental` repo, Ubuntu has never shipped one
+(blocked upstream by a `bind-dyndb-ldap`/bind9 packaging conflict, and its only
+PPA has been dead since 2014), and openSUSE's `security:idm` OBS project ships
+`freeipa-client` only. `install.sh` errors out early with an explanatory message
+on Debian/Ubuntu/openSUSE rather than attempting a broken install.
+
 | Family | Package manager |
 |--------|------------------|
-| RHEL, Fedora, CentOS | `dnf` / `yum` |
-| Debian, Ubuntu | `apt-get` |
-| openSUSE | `zypper` |
+| RHEL, CentOS, AlmaLinux, Rocky | `dnf` / `yum` (`ipa-server`) |
+| Fedora | `dnf` (`freeipa-server`) |
+
+`client.sh` (enrollment only) remains cross-distro — see its own
+[Supported distributions](#supported-distributions-1) table below.
 
 ### Options
 
