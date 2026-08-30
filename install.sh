@@ -51,7 +51,8 @@ FREEIPA_FQDN="${FREEIPA_FQDN:-}"
 FREEIPA_DOMAIN="${FREEIPA_DOMAIN:-}"
 FREEIPA_REALM="${FREEIPA_REALM:-}"
 FREEIPA_PORT="${FREEIPA_PORT:-}"
-FREEIPA_CRED_FILE="${FREEIPA_CRED_FILE:-/root/.freeipa-install.conf}"
+FREEIPA_CRED_FILE="${FREEIPA_CRED_FILE:-/etc/ipa/creds.conf}"
+INSTALL_LEGACY_CRED_FILE="/root/.freeipa-install.conf"
 INSTALL_DNS="false"
 INSTALL_NO_NTP="false"
 INSTALL_USE_AUTO_FORWARDERS="false"
@@ -166,6 +167,24 @@ __load_credential() {
   printf '%s\n' "${val}"
 }
 
+# Older install.sh releases stored credentials at INSTALL_LEGACY_CRED_FILE
+# (a dotfile in /root). On upgrade, move it to the new FREEIPA_CRED_FILE
+# location once, so an upgraded script keeps reading the same generated
+# passwords/ports a previous run already committed to, instead of treating
+# this as a first-ever install and regenerating everything.
+__migrate_legacy_credential_file() {
+  local new_file="${1:?Usage: __migrate_legacy_credential_file <new_file>}"
+  [[ -f "${INSTALL_LEGACY_CRED_FILE}" ]] || return 0
+  [[ -f "${new_file}" ]] && return 0
+  local dir="${new_file%/*}"
+  [[ "${dir}" == "${new_file}" ]] && dir="."
+  \mkdir -p "${dir}"
+  \mv "${INSTALL_LEGACY_CRED_FILE}" "${new_file}"
+  \chmod 600 "${new_file}"
+  \chown root:root "${new_file}"
+  __log "Migrated credentials from ${INSTALL_LEGACY_CRED_FILE} to ${new_file}"
+}
+
 # Older install.sh releases persisted the port credentials under their old
 # INSTALL_* key names. On upgrade, the renamed FREEIPA_* keys used below would
 # be absent from an existing credentials file, causing this script to
@@ -256,7 +275,7 @@ __help() {
   printf '  FREEIPA_DOMAIN           Override auto-detected domain\n'
   printf '  FREEIPA_REALM            Override auto-detected Kerberos realm\n'
   printf '  FREEIPA_PORT             Override auto-detected reverse-proxy port\n'
-  printf '  FREEIPA_CRED_FILE        Credentials file path (default: /root/.freeipa-install.conf)\n'
+  printf '  FREEIPA_CRED_FILE        Credentials file path (default: /etc/ipa/creds.conf)\n'
   printf '  FREEIPA_DEBUG            Enable debug output when set to 1 (same as --debug)\n'
   printf '  FREEIPA_KEYCLOAK_PORT    Override Keycloak port (default: random in 62000-64999)\n'
   printf '  FREEIPA_KEYCLOAK_REALM   Override Keycloak realm (default: domain name)\n'
@@ -283,7 +302,31 @@ __version() {
 __cleanup() {
   [[ -n "${INSTALL_LDIF_TMP}" && -f "${INSTALL_LDIF_TMP}" ]] && \rm -f "${INSTALL_LDIF_TMP}" 2>/dev/null || true
 }
+
+# Diagnostic only — set -e already aborts on the failing command; this just
+# names the line/command so a failure deep in a 10-20 minute run is legible.
+__on_err() {
+  local ec=$?
+  __warn "Command failed (exit ${ec}) at line ${BASH_LINENO[0]:-?}: ${BASH_COMMAND}"
+}
+
+# Re-raise after cleanup so callers still see 128+N, not 0.
+__on_signal() {
+  local sig="${1:?Usage: __on_signal <INT|TERM>}"
+  case "${sig}" in
+    INT) __warn "Interrupted (SIGINT)."; exit 130 ;;
+    TERM) __warn "Terminated (SIGTERM)."; exit 143 ;;
+  esac
+}
+
 trap '__cleanup' EXIT
+trap '__on_err' ERR
+trap '__on_signal INT' INT
+trap '__on_signal TERM' TERM
+# Service restarts under Incus/systemd can emit a spurious SIGHUP during
+# finalization. Ignore it so idempotent reruns complete instead of aborting
+# late in the install.
+trap ':' HUP
 
 # - - - - - - - - - - - - - - - - - - - - - - - - -
 
@@ -2253,6 +2296,7 @@ __main() {
   __detect_domain
   __check_requirements
 
+  __migrate_legacy_credential_file "${FREEIPA_CRED_FILE}"
   __migrate_legacy_credential_keys "${FREEIPA_CRED_FILE}"
 
   # Load or pick stable ports for this installation — both must be set before __configure_firewall

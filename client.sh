@@ -52,7 +52,8 @@ FREEIPA_DOMAIN="${FREEIPA_DOMAIN:-}"
 FREEIPA_REALM="${FREEIPA_REALM:-}"
 FREEIPA_SERVER="${FREEIPA_SERVER:-}"
 FREEIPA_SERVER_IP="${FREEIPA_SERVER_IP:-}"
-FREEIPA_CRED_FILE="${FREEIPA_CRED_FILE:-/root/.freeipa-client.conf}"
+FREEIPA_CRED_FILE="${FREEIPA_CRED_FILE:-/etc/ipa/creds.conf}"
+INSTALL_LEGACY_CRED_FILE="/root/.freeipa-client.conf"
 FREEIPA_ADMIN_PRINCIPAL="${FREEIPA_ADMIN_PRINCIPAL:-admin}"
 FREEIPA_ADMIN_PASSWORD="${FREEIPA_ADMIN_PASSWORD:-}"
 FREEIPA_OTP="${FREEIPA_OTP:-}"
@@ -111,6 +112,23 @@ __save_credential() {
   \chown root:root "${file}"
 }
 
+# Older client.sh releases stored the enrollment record at
+# INSTALL_LEGACY_CRED_FILE (a dotfile in /root). On upgrade, move it to the
+# new FREEIPA_CRED_FILE location once, so an upgraded script keeps reading
+# the same recorded server/domain/realm a previous run already committed to.
+__migrate_legacy_credential_file() {
+  local new_file="${1:?Usage: __migrate_legacy_credential_file <new_file>}"
+  [[ -f "${INSTALL_LEGACY_CRED_FILE}" ]] || return 0
+  [[ -f "${new_file}" ]] && return 0
+  local dir="${new_file%/*}"
+  [[ "${dir}" == "${new_file}" ]] && dir="."
+  \mkdir -p "${dir}"
+  \mv "${INSTALL_LEGACY_CRED_FILE}" "${new_file}"
+  \chmod 600 "${new_file}"
+  \chown root:root "${new_file}"
+  __log "Migrated enrollment record from ${INSTALL_LEGACY_CRED_FILE} to ${new_file}"
+}
+
 # - - - - - - - - - - - - - - - - - - - - - - - - -
 
 # ─── Logging ─────────────────────────────────────────────────────────────────
@@ -163,7 +181,7 @@ __help() {
   printf '  FREEIPA_FQDN             Override this host'"'"'s auto-detected FQDN\n'
   printf '  FREEIPA_DOMAIN           Override auto-detected domain\n'
   printf '  FREEIPA_REALM            Override auto-detected Kerberos realm\n'
-  printf '  FREEIPA_CRED_FILE        Enrollment record path (default: /root/.freeipa-client.conf)\n'
+  printf '  FREEIPA_CRED_FILE        Enrollment record path (default: /etc/ipa/creds.conf)\n'
   printf '  FREEIPA_ADMIN_PRINCIPAL  Enrollment principal (default: admin)\n'
   printf '  FREEIPA_ADMIN_PASSWORD   Enrollment principal'"'"'s password (prompted if unset)\n'
   printf '  FREEIPA_OTP              One-time host password (recommended over the admin\n'
@@ -185,6 +203,39 @@ __help() {
 __version() {
   printf '%s version %s\n' "${APPNAME}" "${VERSION}"
 }
+
+# - - - - - - - - - - - - - - - - - - - - - - - - -
+
+# ─── Cleanup ─────────────────────────────────────────────────────────────────
+
+__cleanup() {
+  :
+}
+
+# Diagnostic only — set -e already aborts on the failing command; this just
+# names the line/command so a failure mid-enrollment is legible.
+__on_err() {
+  local ec=$?
+  __warn "Command failed (exit ${ec}) at line ${BASH_LINENO[0]:-?}: ${BASH_COMMAND}"
+}
+
+# Re-raise after cleanup so callers still see 128+N, not 0.
+__on_signal() {
+  local sig="${1:?Usage: __on_signal <INT|TERM>}"
+  case "${sig}" in
+    INT) __warn "Interrupted (SIGINT)."; exit 130 ;;
+    TERM) __warn "Terminated (SIGTERM)."; exit 143 ;;
+  esac
+}
+
+trap '__cleanup' EXIT
+trap '__on_err' ERR
+trap '__on_signal INT' INT
+trap '__on_signal TERM' TERM
+# Service restarts under Incus/systemd can emit a spurious SIGHUP during
+# finalization. Ignore it so idempotent reruns complete instead of aborting
+# late in enrollment.
+trap ':' HUP
 
 # - - - - - - - - - - - - - - - - - - - - - - - - -
 
@@ -612,6 +663,7 @@ __main() {
   __log "Starting FreeIPA client enrollment"
 
   __check_root
+  __migrate_legacy_credential_file "${FREEIPA_CRED_FILE}"
   __detect_distro
   __check_args
   __configure_hostname

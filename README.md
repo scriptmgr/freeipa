@@ -69,7 +69,7 @@ All steps are idempotent — re-running the script detects existing installs (Fr
 | `FREEIPA_DOMAIN` | auto-detected | Override the detected domain |
 | `FREEIPA_REALM` | auto-detected | Override the detected Kerberos realm |
 | `FREEIPA_PORT` | auto-detected | Override the detected reverse-proxy port |
-| `FREEIPA_CRED_FILE` | `/root/.freeipa-install.conf` | Generated-credentials file path |
+| `FREEIPA_CRED_FILE` | `/etc/ipa/creds.conf` | Generated-credentials file path |
 | `FREEIPA_DEBUG` | `0` | Enable debug output when set to `1` (same as `--debug`) |
 | `FREEIPA_KEYCLOAK_PORT` | random, 62000–64999 | Keycloak HTTP port |
 | `FREEIPA_KEYCLOAK_REALM` | domain name | Keycloak realm name |
@@ -153,7 +153,7 @@ authentication (not NSS-based lookups).
 | `FREEIPA_FQDN` | auto-detected | Override this host's FQDN |
 | `FREEIPA_DOMAIN` | auto-detected | Override the detected domain |
 | `FREEIPA_REALM` | auto-detected | Override the detected Kerberos realm |
-| `FREEIPA_CRED_FILE` | `/root/.freeipa-client.conf` | Enrollment record path |
+| `FREEIPA_CRED_FILE` | `/etc/ipa/creds.conf` | Enrollment record path |
 | `FREEIPA_ADMIN_PRINCIPAL` | `admin` | Enrollment principal |
 | `FREEIPA_ADMIN_PASSWORD` | unset | Enrollment principal's password (prompted if unset) |
 | `FREEIPA_OTP` | unset | One-time host password — recommended over the admin password |
