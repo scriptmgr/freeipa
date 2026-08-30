@@ -1864,7 +1864,11 @@ __configure_postfix() {
     printf 'bind_pw = %s\n' "${INSTALL_MAIL_LDAP_PASSWORD}"
     printf 'search_base = cn=users,cn=accounts,%s\n' "${INSTALL_LDAP_BASE_DN}"
     printf 'scope = sub\n'
-    printf 'query_filter = (&(objectClass=posixAccount)(mail=%%s))\n'
+    # %%u/%%d split the recipient into user/domain parts and recombine against
+    # the canonical mail domain, so a *.FREEIPA_MAIL_DOMAIN subdomain recipient
+    # (accepted by the regexp virtual_mailbox_domains map above) still matches
+    # the user's single canonical "mail" attribute instead of bouncing 550.
+    printf 'query_filter = (&(objectClass=posixAccount)(mail=%%u@%s))\n' "${FREEIPA_MAIL_DOMAIN}"
     printf 'result_attribute = uid\n'
   } > /etc/postfix/ldap/virtual-mailbox.cf
   \chown root:postfix /etc/postfix/ldap/virtual-mailbox.cf
@@ -1881,7 +1885,8 @@ __configure_postfix() {
     printf 'bind_pw = %s\n' "${INSTALL_MAIL_LDAP_PASSWORD}"
     printf 'search_base = cn=users,cn=accounts,%s\n' "${INSTALL_LDAP_BASE_DN}"
     printf 'scope = sub\n'
-    printf 'query_filter = (&(objectClass=posixAccount)(mail=%%s))\n'
+    # Same subdomain-normalization as virtual-mailbox.cf above.
+    printf 'query_filter = (&(objectClass=posixAccount)(mail=%%u@%s))\n' "${FREEIPA_MAIL_DOMAIN}"
     printf 'result_attribute = mail\n'
   } > /etc/postfix/ldap/virtual-alias.cf
   \chown root:postfix /etc/postfix/ldap/virtual-alias.cf
