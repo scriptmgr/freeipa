@@ -80,6 +80,75 @@ All steps are idempotent — re-running the script detects existing installs (Fr
 
 ---
 
+## 🔗 Client enrollment
+
+`client.sh` joins the current host to the FreeIPA realm built by `install.sh`. It
+detects the distro, sets a fully-qualified hostname, installs the client packages,
+and runs `ipa-client-install` — which registers the host's directory entry and
+keytab and configures SSSD/Kerberos.
+
+```bash
+FREEIPA_SERVER=ipa.example.com \
+FREEIPA_OTP="$(ipa host-add client.example.com --random | grep -oP '(?<=Random password: )\S+')" \
+  bash client.sh
+```
+
+Prefer `FREEIPA_OTP` (a single-use host password from `ipa host-add --random`,
+generated on the server) over `INSTALL_ADMIN_PASSWORD` — `ipa-client-install`
+has no stdin input for its password flag, so whichever secret is used is briefly
+visible via process arguments; an OTP only grants that one host's enrollment.
+
+### Supported distributions
+
+| Family | Mechanism |
+|--------|-----------|
+| RHEL, Fedora, CentOS | `freeipa-client` + `ipa-client-install` |
+| Debian, Ubuntu | `freeipa-client` + `ipa-client-install` |
+| openSUSE | `freeipa-client` + `ipa-client-install` |
+| Alpine | Best-effort only — see below |
+
+**Alpine Linux has no `freeipa-client` package**, and musl libc cannot load NSS
+modules, so directory-integrated identity (`getent`/`id`/login) is not possible
+there regardless of backend (confirmed against both `nss-pam-ldapd` and `sssd`
+— see `TODO.AI.md`). `client.sh` installs what actually works: `krb5` (`kinit`
+always works), and on Alpine `edge` only, `sssd` for `pam_sss`-based PAM
+authentication (not NSS-based lookups).
+
+### `client.sh` options
+
+```
+-h, --help              Show help and exit
+-v, --version           Show version and exit
+    --server=HOST       FreeIPA server FQDN (required)
+    --domain=DOMAIN     Override auto-detected domain
+    --realm=REALM       Override auto-detected Kerberos realm
+    --principal=USER    Enrollment principal (default: admin)
+    --force             Pass --force-join to ipa-client-install
+    --no-mkhomedir      Do not create home directories on login
+    --no-ntp            Skip time sync (needed in containers without CAP_SYS_TIME)
+    --debug             Enable debug output
+    --color             Force color output
+    --no-color          Disable color output
+```
+
+### `client.sh` environment variables
+
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `FREEIPA_SERVER` | — | FreeIPA server FQDN (required) |
+| `FREEIPA_SERVER_IP` | unset | Server IP, if not DNS-resolvable |
+| `FREEIPA_FQDN` | auto-detected | Override this host's FQDN |
+| `FREEIPA_DOMAIN` | auto-detected | Override the detected domain |
+| `FREEIPA_REALM` | auto-detected | Override the detected Kerberos realm |
+| `FREEIPA_CRED_FILE` | `/root/.freeipa-client.conf` | Enrollment record path |
+| `INSTALL_ADMIN_PRINCIPAL` | `admin` | Enrollment principal |
+| `INSTALL_ADMIN_PASSWORD` | unset | Enrollment principal's password (prompted if unset) |
+| `FREEIPA_OTP` | unset | One-time host password — recommended over the admin password |
+| `FREEIPA_CA_SHA256` | unset | Expected CA cert SHA-256 fingerprint (Alpine path only) |
+| `NO_COLOR` | unset | Disable color output when set |
+
+---
+
 ## 🛠️ Development
 
 The project is a single shell script. No build step required.
@@ -100,6 +169,7 @@ bash install.sh --help
 | Path | Purpose |
 |------|---------|
 | `install.sh` | Full installer — distro detection, FreeIPA, Keycloak, and LDAP federation |
+| `client.sh` | Client enrollment — distro-agnostic `ipa-client-install` wrapper |
 
 ---
 
