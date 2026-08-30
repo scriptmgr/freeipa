@@ -95,6 +95,19 @@ INSTALL_MAIL_KEYCLOAK_SECRET=""
 
 # ─── Standard Utility Functions ──────────────────────────────────────────────
 
+__primary_ip() {
+  # `hostname -I`'s first token is unreliable once Docker is installed (this
+  # script installs it as a prerequisite): docker0/br-* bridge addresses can
+  # sort before the real outbound interface. Ask the routing table which
+  # source address it would actually use to reach the internet instead.
+  local ip
+  ip="$(\ip -4 route get 1.1.1.1 2>/dev/null | \awk '{for (i = 1; i <= NF; i++) if ($i == "src") print $(i + 1)}')"
+  if [[ -z "${ip}" ]]; then
+    ip="$(\hostname -I 2>/dev/null | \awk '{print $1}' || true)"
+  fi
+  printf '%s' "${ip}"
+}
+
 __random_password() {
   local length="${1:-32}"
   # tr reads /dev/urandom infinitely; head closes the pipe after N bytes, sending
@@ -424,7 +437,7 @@ __configure_hosts() {
   __log "Configuring /etc/hosts..."
 
   local primary_ip short_hostname
-  primary_ip="$(\hostname -I | \awk '{print $1}' || true)"
+  primary_ip="$(__primary_ip)"
   if [[ -z "${primary_ip}" ]]; then
     __warn "Could not detect primary IP address; falling back to 127.0.0.1"
     primary_ip="127.0.0.1"
@@ -1171,7 +1184,7 @@ __install_keycloak_docker() {
   }
 
   local primary_ip
-  primary_ip="$(\hostname -I | \awk '{print $1}' || true)"
+  primary_ip="$(__primary_ip)"
 
   \mkdir -p "${FREEIPA_COMPOSE_DIR}"
 
@@ -2060,7 +2073,7 @@ __configure_dovecot() {
 
 __display_summary() {
   local primary_ip
-  primary_ip="$(\hostname -I | \awk '{print $1}' || true)"
+  primary_ip="$(__primary_ip)"
 
   __log "FreeIPA + Keycloak Installation Summary"
   printf '==========================================\n'
