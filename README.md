@@ -56,6 +56,7 @@ All steps are idempotent — re-running the script detects existing installs (Fr
 -h, --help        Show help and exit
 -v, --version     Show version and exit
     --debug       Enable debug output
+    --no-ntp      Skip time sync (needed in containers without CAP_SYS_TIME)
     --color       Force color output
     --no-color    Disable color output
 ```

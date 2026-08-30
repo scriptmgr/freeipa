@@ -53,6 +53,7 @@ FREEIPA_REALM="${FREEIPA_REALM:-}"
 FREEIPA_PORT="${FREEIPA_PORT:-}"
 FREEIPA_CRED_FILE="${FREEIPA_CRED_FILE:-/root/.freeipa-install.conf}"
 INSTALL_DNS="false"
+INSTALL_NO_NTP="false"
 INSTALL_USE_AUTO_FORWARDERS="false"
 INSTALL_DNS_FORWARDERS=""
 INSTALL_CONFIGURE_REVERSE_ZONE="false"
@@ -231,6 +232,7 @@ __help() {
   printf '  -h, --help        Show this help and exit\n'
   printf '  -v, --version     Show version and exit\n'
   printf '      --debug       Enable debug output\n'
+  printf '      --no-ntp      Skip time sync (needed in containers without CAP_SYS_TIME)\n'
   printf '      --color       Force color output\n'
   printf '      --no-color    Disable color output\n\n'
   printf 'Environment:\n'
@@ -593,6 +595,11 @@ __configure_dns_settings() {
 # ─── NTP / Chrony ────────────────────────────────────────────────────────────
 
 __configure_ntp_settings() {
+  if [[ "${INSTALL_NO_NTP}" == "true" ]]; then
+    __log "Skipping NTP/Chrony configuration (--no-ntp)"
+    return 0
+  fi
+
   __log "Configuring NTP/Chrony..."
 
   # Find the exact unit name (chronyd.service on RHEL, chrony.service on Debian)
@@ -804,6 +811,10 @@ __install_freeipa() {
     "--admin-password=${INSTALL_ADMIN_PASSWORD}"
     "--ds-password=${INSTALL_DM_PASSWORD}"
   )
+
+  if [[ "${INSTALL_NO_NTP}" == "true" ]]; then
+    install_cmd+=( --no-ntp )
+  fi
 
   if [[ "${INSTALL_DNS}" == "true" ]]; then
     install_cmd+=( --setup-dns )
@@ -2158,7 +2169,7 @@ __display_summary() {
 
 __parse_args() {
   local _opts
-  _opts="$(getopt -o hv -l help,version,debug,color,no-color -n "${APPNAME}" -- "$@")" || { __help; exit 2; }
+  _opts="$(getopt -o hv -l help,version,debug,color,no-color,no-ntp -n "${APPNAME}" -- "$@")" || { __help; exit 2; }
   eval set -- "${_opts}"
   while true; do
     case "$1" in
@@ -2172,6 +2183,10 @@ __parse_args() {
         ;;
       --debug)
         FREEIPA_DEBUG=1
+        shift
+        ;;
+      --no-ntp)
+        INSTALL_NO_NTP="true"
         shift
         ;;
       --color)
