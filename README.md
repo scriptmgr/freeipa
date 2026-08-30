@@ -55,6 +55,7 @@ All steps are idempotent — re-running the script detects existing installs (Fr
 -h, --help        Show help and exit
 -v, --version     Show version and exit
     --debug       Enable debug output
+    --color       Force color output
     --no-color    Disable color output
 ```
 
@@ -62,13 +63,13 @@ All steps are idempotent — re-running the script detects existing installs (Fr
 
 | Variable | Default | Purpose |
 |----------|---------|---------|
-| `INSTALL_FQDN` | auto-detected | Override the detected hostname |
-| `INSTALL_DOMAIN` | auto-detected | Override the detected domain |
-| `INSTALL_CRED_FILE` | `/root/.freeipa-install.conf` | Generated-credentials file path |
-| `INSTALL_KEYCLOAK_PORT` | random, 62000–64999 | Keycloak HTTP port |
-| `INSTALL_KEYCLOAK_REALM` | domain name | Keycloak realm name |
-| `INSTALL_COMPOSE_DIR` | `/opt/keycloak` | Docker Compose directory |
-| `INSTALL_KEYCLOAK_CONFIG_DIR` | `/etc/keycloak` | Keycloak keytab/CA config directory |
+| `FREEIPA_FQDN` | auto-detected | Override the detected hostname |
+| `FREEIPA_DOMAIN` | auto-detected | Override the detected domain |
+| `FREEIPA_CRED_FILE` | `/root/.freeipa-install.conf` | Generated-credentials file path |
+| `FREEIPA_KEYCLOAK_PORT` | random, 62000–64999 | Keycloak HTTP port |
+| `FREEIPA_KEYCLOAK_REALM` | domain name | Keycloak realm name |
+| `FREEIPA_COMPOSE_DIR` | `/opt/keycloak` | Docker Compose directory |
+| `FREEIPA_KEYCLOAK_CONFIG_DIR` | `/etc/keycloak` | Keycloak keytab/CA config directory |
 | `NO_COLOR` | unset | Disable color output when set |
 
 ---

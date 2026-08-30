@@ -47,11 +47,11 @@ fi
 INSTALL_DISTRO=""
 INSTALL_DISTRO_FAMILY=""
 INSTALL_DISTRO_VERSION=""
-INSTALL_FQDN="${INSTALL_FQDN:-}"
-INSTALL_DOMAIN="${INSTALL_DOMAIN:-}"
-INSTALL_REALM="${INSTALL_REALM:-}"
-INSTALL_FREEIPA_PORT="${INSTALL_FREEIPA_PORT:-}"
-INSTALL_CRED_FILE="${INSTALL_CRED_FILE:-/root/.freeipa-install.conf}"
+FREEIPA_FQDN="${FREEIPA_FQDN:-}"
+FREEIPA_DOMAIN="${FREEIPA_DOMAIN:-}"
+FREEIPA_REALM="${FREEIPA_REALM:-}"
+FREEIPA_PORT="${FREEIPA_PORT:-}"
+FREEIPA_CRED_FILE="${FREEIPA_CRED_FILE:-/root/.freeipa-install.conf}"
 INSTALL_DNS="false"
 INSTALL_USE_AUTO_FORWARDERS="false"
 INSTALL_DNS_FORWARDERS=""
@@ -65,17 +65,17 @@ INSTALL_CHAIN_PATH=""
 INSTALL_FULLCHAIN_PATH=""
 INSTALL_ADMIN_PASSWORD=""
 INSTALL_DM_PASSWORD=""
-INSTALL_DEBUG="${INSTALL_DEBUG:-0}"
+FREEIPA_DEBUG="${FREEIPA_DEBUG:-0}"
 # - - - - - - - - - - - - - - - - - - - - - - - - -
 # Keycloak / LDAP globals
 INSTALL_LDAP_BASE_DN=""
-INSTALL_KEYCLOAK_PORT="${INSTALL_KEYCLOAK_PORT:-}"
-INSTALL_KEYCLOAK_REALM="${INSTALL_KEYCLOAK_REALM:-}"
+FREEIPA_KEYCLOAK_PORT="${FREEIPA_KEYCLOAK_PORT:-}"
+FREEIPA_KEYCLOAK_REALM="${FREEIPA_KEYCLOAK_REALM:-}"
 INSTALL_KEYCLOAK_ADMIN_PASSWORD=""
 INSTALL_KEYCLOAK_LDAP_PASSWORD=""
 INSTALL_KEYCLOAK_DB_PASSWORD=""
-INSTALL_COMPOSE_DIR="${INSTALL_COMPOSE_DIR:-/opt/keycloak}"
-INSTALL_KEYCLOAK_CONFIG_DIR="${INSTALL_KEYCLOAK_CONFIG_DIR:-/etc/keycloak}"
+FREEIPA_COMPOSE_DIR="${FREEIPA_COMPOSE_DIR:-/opt/keycloak}"
+FREEIPA_KEYCLOAK_CONFIG_DIR="${FREEIPA_KEYCLOAK_CONFIG_DIR:-/etc/keycloak}"
 INSTALL_LDIF_TMP=""
 # - - - - - - - - - - - - - - - - - - - - - - - - -
 
@@ -105,7 +105,9 @@ __save_credential() {
   local file="${1:?Usage: __save_credential <file> <key> <value>}"
   local key="${2:?}"
   local value="${3:?}"
-  \mkdir -p "$(\dirname -- "${file}")"
+  local _dir="${file%/*}"
+  [[ "${_dir}" == "${file}" ]] && _dir="."
+  \mkdir -p "${_dir}"
   if [[ -f "${file}" ]] && \grep -q -- "^${key}=" "${file}"; then
     local tmp
     tmp="$(\mktemp)"
@@ -132,6 +134,26 @@ __load_credential() {
   val="$(\grep -- "^${key}=" "${file}" | \tail -n1 | \cut -d= -f2- || true)"
   [[ -n "${val}" ]] || return 1
   printf '%s\n' "${val}"
+}
+
+# Older install.sh releases persisted the port credentials under their old
+# INSTALL_* key names. On upgrade, the renamed FREEIPA_* keys used below would
+# be absent from an existing credentials file, causing this script to
+# generate and save a brand-new random port that doesn't match the port the
+# already-deployed Keycloak container is actually bound to. Rename the
+# legacy keys in place, once, so an upgraded script keeps reading the same
+# port a previous run already committed to.
+__migrate_legacy_credential_keys() {
+  local file="${1:?Usage: __migrate_legacy_credential_keys <file>}"
+  [[ -f "${file}" ]] || return 0
+  local old new
+  for pair in "INSTALL_FREEIPA_PORT:FREEIPA_PORT" "INSTALL_KEYCLOAK_PORT:FREEIPA_KEYCLOAK_PORT"; do
+    old="${pair%%:*}"
+    new="${pair##*:}"
+    if \grep -q -- "^${old}=" "${file}" && ! \grep -q -- "^${new}=" "${file}"; then
+      \sed -i "s/^${old}=/${new}=/" "${file}"
+    fi
+  done
 }
 
 __determine_domain_name() {
@@ -178,7 +200,7 @@ __error() {
 }
 
 __debug() {
-  if [[ "${INSTALL_DEBUG}" -eq 1 ]]; then
+  if [[ "${FREEIPA_DEBUG}" -eq 1 ]]; then
     printf "${INSTALL_COLOR_BLUE}[DEBUG] %s${INSTALL_COLOR_RESET}\n" "$1" >&2
   fi
 }
@@ -196,15 +218,16 @@ __help() {
   printf '  -h, --help        Show this help and exit\n'
   printf '  -v, --version     Show version and exit\n'
   printf '      --debug       Enable debug output\n'
+  printf '      --color       Force color output\n'
   printf '      --no-color    Disable color output\n\n'
   printf 'Environment:\n'
-  printf '  INSTALL_FQDN             Override auto-detected hostname\n'
-  printf '  INSTALL_DOMAIN           Override auto-detected domain\n'
-  printf '  INSTALL_CRED_FILE        Credentials file path (default: /root/.freeipa-install.conf)\n'
-  printf '  INSTALL_KEYCLOAK_PORT    Override Keycloak port (default: random in 62000-64999)\n'
-  printf '  INSTALL_KEYCLOAK_REALM   Override Keycloak realm (default: domain name)\n'
-  printf '  INSTALL_COMPOSE_DIR      Docker Compose directory (default: /opt/keycloak)\n'
-  printf '  INSTALL_KEYCLOAK_CONFIG_DIR  Keycloak config directory (default: /etc/keycloak)\n'
+  printf '  FREEIPA_FQDN             Override auto-detected hostname\n'
+  printf '  FREEIPA_DOMAIN           Override auto-detected domain\n'
+  printf '  FREEIPA_CRED_FILE        Credentials file path (default: /root/.freeipa-install.conf)\n'
+  printf '  FREEIPA_KEYCLOAK_PORT    Override Keycloak port (default: random in 62000-64999)\n'
+  printf '  FREEIPA_KEYCLOAK_REALM   Override Keycloak realm (default: domain name)\n'
+  printf '  FREEIPA_COMPOSE_DIR      Docker Compose directory (default: /opt/keycloak)\n'
+  printf '  FREEIPA_KEYCLOAK_CONFIG_DIR  Keycloak config directory (default: /etc/keycloak)\n'
   printf '  NO_COLOR                 Disable color output when set\n'
 }
 
@@ -252,7 +275,7 @@ __check_requirements() {
     __warn "Less than 10 GB disk space available (${disk_gb} GB). Consider freeing up space."
   fi
 
-  if [[ "${INSTALL_FQDN}" == "localhost" || "${INSTALL_FQDN}" == "localhost.localdomain" ]]; then
+  if [[ "${FREEIPA_FQDN}" == "localhost" || "${FREEIPA_FQDN}" == "localhost.localdomain" ]]; then
     __error "Hostname is set to localhost. Configure a proper FQDN first."
   fi
 
@@ -290,37 +313,37 @@ __detect_distro() {
 # ─── Domain / hostname detection ─────────────────────────────────────────────
 
 __detect_domain() {
-  INSTALL_FQDN="${INSTALL_FQDN:-$(__determine_hostname_name 2>/dev/null || \hostname)}"
+  FREEIPA_FQDN="${FREEIPA_FQDN:-$(__determine_hostname_name 2>/dev/null || \hostname)}"
 
-  if [[ "${INSTALL_FQDN}" == *.* ]]; then
+  if [[ "${FREEIPA_FQDN}" == *.* ]]; then
     # Extract domain from FQDN (everything after first label)
-    INSTALL_DOMAIN="${INSTALL_DOMAIN:-${INSTALL_FQDN#*.}}"
-    INSTALL_REALM="${INSTALL_REALM:-${INSTALL_DOMAIN^^}}"
+    FREEIPA_DOMAIN="${FREEIPA_DOMAIN:-${FREEIPA_FQDN#*.}}"
+    FREEIPA_REALM="${FREEIPA_REALM:-${FREEIPA_DOMAIN^^}}"
 
     # For complex domains (>2 labels), note the primary domain
     local domain_parts
-    domain_parts="${INSTALL_DOMAIN//[^.]}"
+    domain_parts="${FREEIPA_DOMAIN//[^.]}"
     if [[ ${#domain_parts} -gt 1 ]]; then
       local primary_domain
-      primary_domain="${INSTALL_DOMAIN##*.}"
-      primary_domain="${INSTALL_DOMAIN%.*}.${primary_domain}"
+      primary_domain="${FREEIPA_DOMAIN##*.}"
+      primary_domain="${FREEIPA_DOMAIN%.*}.${primary_domain}"
       __log "Complex domain detected; primary domain: ${primary_domain}"
     fi
   else
     if [[ -t 0 ]]; then
       __warn "No domain found in hostname. Enter domain manually:"
       printf 'Enter domain (e.g., example.com): '
-      read -r INSTALL_DOMAIN
+      read -r FREEIPA_DOMAIN
     else
-      __error "Non-interactive mode and no domain in hostname. Set INSTALL_DOMAIN env var."
+      __error "Non-interactive mode and no domain in hostname. Set FREEIPA_DOMAIN env var."
     fi
-    INSTALL_REALM="${INSTALL_DOMAIN^^}"
-    INSTALL_FQDN="${INSTALL_FQDN}.${INSTALL_DOMAIN}"
+    FREEIPA_REALM="${FREEIPA_DOMAIN^^}"
+    FREEIPA_FQDN="${FREEIPA_FQDN}.${FREEIPA_DOMAIN}"
   fi
 
-  __log "Using hostname: ${INSTALL_FQDN}"
-  __log "Using domain:   ${INSTALL_DOMAIN}"
-  __log "Using realm:    ${INSTALL_REALM}"
+  __log "Using hostname: ${FREEIPA_FQDN}"
+  __log "Using domain:   ${FREEIPA_DOMAIN}"
+  __log "Using realm:    ${FREEIPA_REALM}"
 }
 
 # - - - - - - - - - - - - - - - - - - - - - - - - -
@@ -379,9 +402,9 @@ __configure_hosts() {
   __log "Using IP address: ${primary_ip}"
 
   # Remove any existing entries for this FQDN then re-add with correct IP
-  \sed -i "/${INSTALL_FQDN}/d" /etc/hosts
-  short_hostname="${INSTALL_FQDN%%.*}"
-  printf '%s %s %s\n' "${primary_ip}" "${INSTALL_FQDN}" "${short_hostname}" >> /etc/hosts
+  \sed -i "/${FREEIPA_FQDN}/d" /etc/hosts
+  short_hostname="${FREEIPA_FQDN%%.*}"
+  printf '%s %s %s\n' "${primary_ip}" "${FREEIPA_FQDN}" "${short_hostname}" >> /etc/hosts
 
   __log "Updated /etc/hosts"
 }
@@ -487,7 +510,7 @@ __configure_ssl_certs() {
     INSTALL_USE_LETSENCRYPT="true"
     INSTALL_USE_SELFSIGNED="false"
     INSTALL_USE_FREEIPA_CA="false"
-    return
+    return 0
   fi
 
   # Fall back to FreeIPA's built-in CA
@@ -504,7 +527,7 @@ __configure_ssl_certs() {
 __configure_dns_settings() {
   __log "Auto-detecting DNS configuration..."
 
-  if ! \nslookup "${INSTALL_FQDN}" >/dev/null 2>&1; then
+  if ! \nslookup "${FREEIPA_FQDN}" >/dev/null 2>&1; then
     __log "Hostname not resolvable via DNS; will install integrated DNS server"
     INSTALL_DNS="true"
     INSTALL_CONFIGURE_REVERSE_ZONE="true"
@@ -514,7 +537,7 @@ __configure_dns_settings() {
     local _ns _ipv4_fwds=""
     while IFS= read -r _ns; do
       _ipv4_fwds="${_ipv4_fwds:+${_ipv4_fwds} }${_ns}"
-    done < <(\grep -E '^nameserver[[:space:]]+[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' /etc/resolv.conf | \awk '{print $2}')
+    done < <(\grep -E -- '^nameserver[[:space:]]+[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' /etc/resolv.conf | \awk '{print $2}')
     if [[ -n "${_ipv4_fwds}" ]]; then
       __log "Using IPv4 DNS forwarders: ${_ipv4_fwds}"
       INSTALL_DNS_FORWARDERS="${_ipv4_fwds}"
@@ -586,13 +609,13 @@ __configure_firewall() {
     fi
 
     # Custom HTTPS port for the FreeIPA reverse proxy
-    \firewall-cmd --permanent --add-port="${INSTALL_FREEIPA_PORT}/tcp"
+    \firewall-cmd --permanent --add-port="${FREEIPA_PORT}/tcp"
 
     \firewall-cmd --permanent --add-service=kerberos
     \firewall-cmd --permanent --add-service=ntp
 
     # Keycloak port (internal Docker bridge — open for reverse proxy reach)
-    \firewall-cmd --permanent --add-port="${INSTALL_KEYCLOAK_PORT}/tcp"
+    \firewall-cmd --permanent --add-port="${FREEIPA_KEYCLOAK_PORT}/tcp"
     # Mosh server uses UDP 60000-61000 for encrypted remote terminal sessions
     \firewall-cmd --permanent --add-port=60000-61000/udp
     # Allow ICMP ping for monitoring
@@ -613,7 +636,7 @@ __configure_firewall() {
     \ufw allow 80/tcp
     \ufw allow 443/tcp
     # Custom HTTPS port for the FreeIPA reverse proxy
-    \ufw allow "${INSTALL_FREEIPA_PORT}/tcp"
+    \ufw allow "${FREEIPA_PORT}/tcp"
     # LDAP
     \ufw allow 389/tcp
     # LDAPS
@@ -635,17 +658,30 @@ __configure_firewall() {
     fi
 
     # Keycloak port
-    \ufw allow "${INSTALL_KEYCLOAK_PORT}/tcp"
+    \ufw allow "${FREEIPA_KEYCLOAK_PORT}/tcp"
     # Mosh server uses UDP 60000-61000 for encrypted remote terminal sessions
     \ufw allow 60000:61000/udp
     # Allow ICMP ping — inject into before.rules if not already present
-    if [ -f /etc/ufw/before.rules ] && ! \grep -q "# ICMP ping allow" /etc/ufw/before.rules 2>/dev/null; then
-      \sed -i '/^COMMIT$/i # ICMP ping allow\n-A ufw-before-input -p icmp --icmp-type echo-request -j ACCEPT\n-A ufw-before-input -p icmp --icmp-type echo-reply -j ACCEPT' /etc/ufw/before.rules 2>/dev/null || true
+    if [ -f /etc/ufw/before.rules ] && ! \grep -q -- "# ICMP ping allow" /etc/ufw/before.rules 2>/dev/null; then
+      \sed -i \
+        '/^COMMIT$/i # ICMP ping allow\n-A ufw-before-input -p icmp --icmp-type echo-request -j ACCEPT\n-A ufw-before-input -p icmp --icmp-type echo-reply -j ACCEPT' \
+        /etc/ufw/before.rules 2>/dev/null || true
     fi
 
     __log "UFW configured"
   else
     __log "No supported firewall found; skipping firewall configuration"
+  fi
+
+  # firewalld's --reload and ufw's enable/allow calls rewrite the host's
+  # iptables/nftables ruleset, which wipes or reorders the DOCKER/DOCKER-*
+  # forwarding chains Docker installed at daemon-start time. Left alone,
+  # this silently drops inter-container traffic on Docker's bridge networks
+  # (observed as Keycloak losing its Postgres connection). Restarting Docker
+  # here makes it reinstall its rules on top of the final firewall state.
+  if \systemctl is-active --quiet docker 2>/dev/null; then
+    __log "Restarting Docker to reinstall its network rules after firewall changes..."
+    \systemctl restart docker
   fi
 }
 
@@ -689,11 +725,11 @@ __install_freeipa() {
   if [[ -f "/etc/ipa/default.conf" ]]; then
     __log "FreeIPA already installed (/etc/ipa/default.conf exists); skipping ipa-server-install"
     # Still load credentials so downstream functions have them
-    INSTALL_ADMIN_PASSWORD="$(__load_credential "${INSTALL_CRED_FILE}" INSTALL_ADMIN_PASSWORD)" || {
-      __warn "FreeIPA installed but admin password not found in ${INSTALL_CRED_FILE}"
+    INSTALL_ADMIN_PASSWORD="$(__load_credential "${FREEIPA_CRED_FILE}" INSTALL_ADMIN_PASSWORD)" || {
+      __warn "FreeIPA installed but admin password not found in ${FREEIPA_CRED_FILE}"
     }
-    INSTALL_DM_PASSWORD="$(__load_credential "${INSTALL_CRED_FILE}" INSTALL_DM_PASSWORD)" || {
-      __warn "FreeIPA installed but DM password not found in ${INSTALL_CRED_FILE}"
+    INSTALL_DM_PASSWORD="$(__load_credential "${FREEIPA_CRED_FILE}" INSTALL_DM_PASSWORD)" || {
+      __warn "FreeIPA installed but DM password not found in ${FREEIPA_CRED_FILE}"
     }
     return 0
   fi
@@ -701,15 +737,15 @@ __install_freeipa() {
   __log "Starting FreeIPA server installation..."
 
   # Load or generate admin password
-  INSTALL_ADMIN_PASSWORD="$(__load_credential "${INSTALL_CRED_FILE}" INSTALL_ADMIN_PASSWORD)" || {
+  INSTALL_ADMIN_PASSWORD="$(__load_credential "${FREEIPA_CRED_FILE}" INSTALL_ADMIN_PASSWORD)" || {
     INSTALL_ADMIN_PASSWORD="$(__random_password 25)"
-    __save_credential "${INSTALL_CRED_FILE}" INSTALL_ADMIN_PASSWORD "${INSTALL_ADMIN_PASSWORD}"
+    __save_credential "${FREEIPA_CRED_FILE}" INSTALL_ADMIN_PASSWORD "${INSTALL_ADMIN_PASSWORD}"
   }
 
   # Load or generate Directory Manager password
-  INSTALL_DM_PASSWORD="$(__load_credential "${INSTALL_CRED_FILE}" INSTALL_DM_PASSWORD)" || {
+  INSTALL_DM_PASSWORD="$(__load_credential "${FREEIPA_CRED_FILE}" INSTALL_DM_PASSWORD)" || {
     INSTALL_DM_PASSWORD="$(__random_password 25)"
-    __save_credential "${INSTALL_CRED_FILE}" INSTALL_DM_PASSWORD "${INSTALL_DM_PASSWORD}"
+    __save_credential "${FREEIPA_CRED_FILE}" INSTALL_DM_PASSWORD "${INSTALL_DM_PASSWORD}"
   }
 
   # Build installation command as an array to avoid quoting/eval issues
@@ -717,9 +753,9 @@ __install_freeipa() {
   install_cmd=(
     \ipa-server-install
     --unattended
-    "--realm=${INSTALL_REALM}"
-    "--domain=${INSTALL_DOMAIN}"
-    "--hostname=${INSTALL_FQDN}"
+    "--realm=${FREEIPA_REALM}"
+    "--domain=${FREEIPA_DOMAIN}"
+    "--hostname=${FREEIPA_FQDN}"
     "--admin-password=${INSTALL_ADMIN_PASSWORD}"
     "--ds-password=${INSTALL_DM_PASSWORD}"
   )
@@ -783,7 +819,7 @@ __configure_reverse_proxy() {
     rewrite_conf="/etc/apache2/conf-available/ipa-rewrite.conf"
   else
     __warn "Could not find Apache configuration directory; skipping reverse proxy config"
-    return
+    return 0
   fi
 
   # Step 1: Write a minimal port-only config — just adds a Listen directive.
@@ -793,8 +829,8 @@ __configure_reverse_proxy() {
   local apache_port_conf="${apache_conf_dir}/freeipa-port.conf"
   \cat > "${apache_port_conf}" << EOF
 # FreeIPA custom port for reverse proxy — managed by install.sh
-# Adds a second Listen so the ssl.conf VirtualHost also accepts INSTALL_FREEIPA_PORT.
-Listen ${INSTALL_FREEIPA_PORT} https
+# Adds a second Listen so the ssl.conf VirtualHost also accepts FREEIPA_PORT.
+Listen ${FREEIPA_PORT} https
 EOF
 
   # Enable the configuration if using Apache2's conf-enabled mechanism
@@ -802,29 +838,29 @@ EOF
     \ln -sf "${apache_port_conf}" /etc/apache2/conf-enabled/freeipa-port.conf
   fi
 
-  # Step 2: Extend the existing SSL VirtualHost to also accept INSTALL_FREEIPA_PORT.
+  # Step 2: Extend the existing SSL VirtualHost to also accept FREEIPA_PORT.
   # ssl.conf has <VirtualHost _default_:443> — change it to accept both ports.
   # This avoids duplicating any of the WSGI/SSL directives.
   if [[ -f "${ssl_conf}" ]]; then
-    \sed -i "s|<VirtualHost _default_:443>|<VirtualHost _default_:443 _default_:${INSTALL_FREEIPA_PORT}>|" \
+    \sed -i "s|<VirtualHost _default_:443>|<VirtualHost _default_:443 _default_:${FREEIPA_PORT}>|" \
       "${ssl_conf}" 2>/dev/null || true
-    __log "Extended ssl.conf VirtualHost to also listen on port ${INSTALL_FREEIPA_PORT}"
+    __log "Extended ssl.conf VirtualHost to also listen on port ${FREEIPA_PORT}"
   fi
 
   # Step 3: Patch ipa-rewrite.conf so it does not redirect requests arriving on
-  # INSTALL_FREEIPA_PORT back to port 443 (which would cause infinite redirect
+  # FREEIPA_PORT back to port 443 (which would cause infinite redirect
   # loops when nginx proxies to our custom port).
   if [[ -f "${rewrite_conf}" ]]; then
     # Insert an extra RewriteCond to exclude our custom port, immediately after
     # the existing !^443$ condition line.
-    if ! \grep -q "!^${INSTALL_FREEIPA_PORT}\$" "${rewrite_conf}" 2>/dev/null; then
-      \sed -i "/RewriteCond %{SERVER_PORT}[[:space:]]*!\^443\\\$/a RewriteCond %{SERVER_PORT}  !^${INSTALL_FREEIPA_PORT}$" \
+    if ! \grep -q -- "!^${FREEIPA_PORT}\$" "${rewrite_conf}" 2>/dev/null; then
+      \sed -i "/RewriteCond %{SERVER_PORT}[[:space:]]*!\^443\\\$/a RewriteCond %{SERVER_PORT}  !^${FREEIPA_PORT}$" \
         "${rewrite_conf}" 2>/dev/null || true
-      __log "Patched ipa-rewrite.conf to skip redirect for port ${INSTALL_FREEIPA_PORT}"
+      __log "Patched ipa-rewrite.conf to skip redirect for port ${FREEIPA_PORT}"
     fi
   fi
 
-  __log "Configured Apache to listen on port ${INSTALL_FREEIPA_PORT}"
+  __log "Configured Apache to listen on port ${FREEIPA_PORT}"
 
   local _web_units
   _web_units="$(\systemctl list-unit-files 2>/dev/null | \awk '{print $1}' || true)"
@@ -842,13 +878,13 @@ EOF
 __derive_ldap_base_dn() {
   local dn="" part
   local IFS='.'
-  for part in ${INSTALL_DOMAIN}; do
+  for part in ${FREEIPA_DOMAIN}; do
     dn="${dn},dc=${part}"
   done
   INSTALL_LDAP_BASE_DN="${dn#,}"
-  INSTALL_KEYCLOAK_REALM="${INSTALL_KEYCLOAK_REALM:-${INSTALL_DOMAIN}}"
+  FREEIPA_KEYCLOAK_REALM="${FREEIPA_KEYCLOAK_REALM:-${FREEIPA_DOMAIN}}"
   __log "LDAP base DN: ${INSTALL_LDAP_BASE_DN}"
-  __log "Keycloak realm: ${INSTALL_KEYCLOAK_REALM}"
+  __log "Keycloak realm: ${FREEIPA_KEYCLOAK_REALM}"
 }
 
 # - - - - - - - - - - - - - - - - - - - - - - - - -
@@ -953,15 +989,15 @@ __setup_freeipa_for_keycloak() {
   __log "Configuring FreeIPA for Keycloak LDAP federation..."
 
   # Load or generate Keycloak LDAP bind password
-  INSTALL_KEYCLOAK_LDAP_PASSWORD="$(__load_credential "${INSTALL_CRED_FILE}" INSTALL_KEYCLOAK_LDAP_PASSWORD)" || {
+  INSTALL_KEYCLOAK_LDAP_PASSWORD="$(__load_credential "${FREEIPA_CRED_FILE}" INSTALL_KEYCLOAK_LDAP_PASSWORD)" || {
     INSTALL_KEYCLOAK_LDAP_PASSWORD="$(__random_password 32)"
-    __save_credential "${INSTALL_CRED_FILE}" INSTALL_KEYCLOAK_LDAP_PASSWORD "${INSTALL_KEYCLOAK_LDAP_PASSWORD}"
+    __save_credential "${FREEIPA_CRED_FILE}" INSTALL_KEYCLOAK_LDAP_PASSWORD "${INSTALL_KEYCLOAK_LDAP_PASSWORD}"
   }
 
-  \mkdir -p "${INSTALL_KEYCLOAK_CONFIG_DIR}"
+  \mkdir -p "${FREEIPA_KEYCLOAK_CONFIG_DIR}"
 
   # Obtain a Kerberos ticket for the admin user
-  printf '%s\n' "${INSTALL_ADMIN_PASSWORD}" | \kinit "admin@${INSTALL_REALM}"
+  printf '%s\n' "${INSTALL_ADMIN_PASSWORD}" | \kinit "admin@${FREEIPA_REALM}"
 
   # Create temp dir before mktemp to ensure parent exists
   \mkdir -p "${TMPDIR:-/tmp}/scriptmgr"
@@ -973,28 +1009,56 @@ __setup_freeipa_for_keycloak() {
     printf 'objectClass: account\n'
     printf 'objectClass: simplesecurityobject\n'
     printf 'uid: keycloak\n'
-    printf 'userPassword: {cleartext}%s\n' "${INSTALL_KEYCLOAK_LDAP_PASSWORD}"
+    # 389-ds only recognizes its own registered storage-scheme prefixes;
+    # {cleartext} is not one of them (the scheme is named "Clear", prefix
+    # {CLEAR}) so a value tagged with it fails to verify on bind.
+    printf 'userPassword: {CLEAR}%s\n' "${INSTALL_KEYCLOAK_LDAP_PASSWORD}"
     printf 'passwordExpirationTime: 20380119031407Z\n'
     printf 'nsIdleTimeout: 0\n'
   } > "${INSTALL_LDIF_TMP}"
 
   # Use FQDN — not localhost — so Kerberos resolves ldap/{FQDN}@REALM correctly
-  \ldapadd -Y GSSAPI -H "ldap://${INSTALL_FQDN}" -f "${INSTALL_LDIF_TMP}" || true
+  # ldapadd is add-only: on a re-run the entry already exists and this fails,
+  # which previously left userPassword un-synced with FREEIPA_CRED_FILE if it
+  # was ever set incorrectly. Fall back to an explicit password replace so
+  # the LDAP entry always converges on the saved credential.
+  if ! \ldapadd -Y GSSAPI -H "ldap://${FREEIPA_FQDN}" -f "${INSTALL_LDIF_TMP}" 2>/dev/null; then
+    {
+      printf 'dn: uid=keycloak,cn=sysaccounts,cn=etc,%s\n' "${INSTALL_LDAP_BASE_DN}"
+      printf 'changetype: modify\n'
+      printf 'replace: userPassword\n'
+      printf 'userPassword: {CLEAR}%s\n' "${INSTALL_KEYCLOAK_LDAP_PASSWORD}"
+    } | \ldapmodify -Y GSSAPI -H "ldap://${FREEIPA_FQDN}" || true
+  fi
 
   # Remove LDIF immediately — it contained a cleartext password
   \rm -f "${INSTALL_LDIF_TMP}"
   INSTALL_LDIF_TMP=""
 
   # Create HTTP service principal for Kerberos SPNEGO
-  \ipa service-add "HTTP/${INSTALL_FQDN}" 2>/dev/null || true
+  \ipa service-add "HTTP/${FREEIPA_FQDN}" 2>/dev/null || true
 
   # Export keytab for Keycloak
-  \ipa-getkeytab -p "HTTP/${INSTALL_FQDN}@${INSTALL_REALM}" -k "${INSTALL_KEYCLOAK_CONFIG_DIR}/keycloak.keytab"
-  \chmod 600 "${INSTALL_KEYCLOAK_CONFIG_DIR}/keycloak.keytab"
+  \ipa-getkeytab -p "HTTP/${FREEIPA_FQDN}@${FREEIPA_REALM}" -k "${FREEIPA_KEYCLOAK_CONFIG_DIR}/keycloak.keytab"
+  \chmod 600 "${FREEIPA_KEYCLOAK_CONFIG_DIR}/keycloak.keytab"
+
+  # ipa-getkeytab generates a fresh random key each time it exports one for
+  # this principal, bumping its kvno. Since HTTP/${FREEIPA_FQDN} is the same
+  # principal Apache's own gssproxy keytab was provisioned with, the export
+  # above just invalidated Apache's copy — breaking IPA's own web UI/CLI
+  # SPNEGO auth. Re-sync gssproxy's keytab to the same new key immediately
+  # so both consumers stay in sync, then restart gssproxy to pick it up.
+  local _gssproxy_keytab="/var/lib/ipa/gssproxy/http.keytab"
+  if [[ -f "${_gssproxy_keytab}" ]]; then
+    \ipa-getkeytab -p "HTTP/${FREEIPA_FQDN}@${FREEIPA_REALM}" -k "${_gssproxy_keytab}"
+    \chown root:root "${_gssproxy_keytab}"
+    \chmod 600 "${_gssproxy_keytab}"
+    \systemctl restart gssproxy
+  fi
 
   # Export IPA CA certificate so Keycloak can trust LDAPS
-  \cp /etc/ipa/ca.crt "${INSTALL_KEYCLOAK_CONFIG_DIR}/ipa-ca.crt"
-  \chmod 644 "${INSTALL_KEYCLOAK_CONFIG_DIR}/ipa-ca.crt"
+  \cp /etc/ipa/ca.crt "${FREEIPA_KEYCLOAK_CONFIG_DIR}/ipa-ca.crt"
+  \chmod 644 "${FREEIPA_KEYCLOAK_CONFIG_DIR}/ipa-ca.crt"
 
   # Destroy Kerberos ticket — no longer needed
   \kdestroy 2>/dev/null || true
@@ -1023,40 +1087,40 @@ __install_keycloak_docker() {
   # credentials are loaded and skip docker-compose regeneration.
   if \docker inspect keycloak >/dev/null 2>&1; then
     __log "Keycloak container already exists; loading credentials and skipping redeploy"
-    INSTALL_KEYCLOAK_ADMIN_PASSWORD="$(__load_credential "${INSTALL_CRED_FILE}" INSTALL_KEYCLOAK_ADMIN_PASSWORD)" || {
-      __warn "Keycloak running but admin password not in ${INSTALL_CRED_FILE}"
+    INSTALL_KEYCLOAK_ADMIN_PASSWORD="$(__load_credential "${FREEIPA_CRED_FILE}" INSTALL_KEYCLOAK_ADMIN_PASSWORD)" || {
+      __warn "Keycloak running but admin password not in ${FREEIPA_CRED_FILE}"
     }
-    INSTALL_KEYCLOAK_DB_PASSWORD="$(__load_credential "${INSTALL_CRED_FILE}" INSTALL_KEYCLOAK_DB_PASSWORD)" || true
+    INSTALL_KEYCLOAK_DB_PASSWORD="$(__load_credential "${FREEIPA_CRED_FILE}" INSTALL_KEYCLOAK_DB_PASSWORD)" || true
     return 0
   fi
 
   __log "Deploying Keycloak via Docker Compose..."
 
   # Load or generate Keycloak admin password
-  INSTALL_KEYCLOAK_ADMIN_PASSWORD="$(__load_credential "${INSTALL_CRED_FILE}" INSTALL_KEYCLOAK_ADMIN_PASSWORD)" || {
+  INSTALL_KEYCLOAK_ADMIN_PASSWORD="$(__load_credential "${FREEIPA_CRED_FILE}" INSTALL_KEYCLOAK_ADMIN_PASSWORD)" || {
     INSTALL_KEYCLOAK_ADMIN_PASSWORD="$(__random_password 32)"
-    __save_credential "${INSTALL_CRED_FILE}" INSTALL_KEYCLOAK_ADMIN_PASSWORD "${INSTALL_KEYCLOAK_ADMIN_PASSWORD}"
+    __save_credential "${FREEIPA_CRED_FILE}" INSTALL_KEYCLOAK_ADMIN_PASSWORD "${INSTALL_KEYCLOAK_ADMIN_PASSWORD}"
   }
 
   # Load or generate Keycloak database password
-  INSTALL_KEYCLOAK_DB_PASSWORD="$(__load_credential "${INSTALL_CRED_FILE}" INSTALL_KEYCLOAK_DB_PASSWORD)" || {
+  INSTALL_KEYCLOAK_DB_PASSWORD="$(__load_credential "${FREEIPA_CRED_FILE}" INSTALL_KEYCLOAK_DB_PASSWORD)" || {
     INSTALL_KEYCLOAK_DB_PASSWORD="$(__random_password 32)"
-    __save_credential "${INSTALL_CRED_FILE}" INSTALL_KEYCLOAK_DB_PASSWORD "${INSTALL_KEYCLOAK_DB_PASSWORD}"
+    __save_credential "${FREEIPA_CRED_FILE}" INSTALL_KEYCLOAK_DB_PASSWORD "${INSTALL_KEYCLOAK_DB_PASSWORD}"
   }
 
   # Load or generate stable Keycloak port
-  INSTALL_KEYCLOAK_PORT="$(__load_credential "${INSTALL_CRED_FILE}" INSTALL_KEYCLOAK_PORT)" || {
-    INSTALL_KEYCLOAK_PORT="$(__random_port)"
-    __save_credential "${INSTALL_CRED_FILE}" INSTALL_KEYCLOAK_PORT "${INSTALL_KEYCLOAK_PORT}"
+  FREEIPA_KEYCLOAK_PORT="$(__load_credential "${FREEIPA_CRED_FILE}" FREEIPA_KEYCLOAK_PORT)" || {
+    FREEIPA_KEYCLOAK_PORT="$(__random_port)"
+    __save_credential "${FREEIPA_CRED_FILE}" FREEIPA_KEYCLOAK_PORT "${FREEIPA_KEYCLOAK_PORT}"
   }
 
   local primary_ip
   primary_ip="$(\hostname -I | \awk '{print $1}' || true)"
 
-  \mkdir -p "${INSTALL_COMPOSE_DIR}"
+  \mkdir -p "${FREEIPA_COMPOSE_DIR}"
 
   # Generate docker-compose.yml with all values hardcoded — no .env required
-  \cat > "${INSTALL_COMPOSE_DIR}/docker-compose.yml" << EOF
+  \cat > "${FREEIPA_COMPOSE_DIR}/docker-compose.yml" << EOF
 # Generated by install.sh — do not edit manually
 # Regenerate by re-running install.sh
 
@@ -1097,7 +1161,7 @@ services:
       KC_DB_USERNAME: keycloak
       KC_DB_PASSWORD: "${INSTALL_KEYCLOAK_DB_PASSWORD}"
       KC_HTTP_ENABLED: "true"
-      KC_HTTP_PORT: "${INSTALL_KEYCLOAK_PORT}"
+      KC_HTTP_PORT: "${FREEIPA_KEYCLOAK_PORT}"
       KC_HOSTNAME_STRICT: "false"
       KC_PROXY: edge
       KC_TRUSTSTORE_PATHS: /etc/keycloak/ipa-ca.crt
@@ -1106,26 +1170,31 @@ services:
       KC_LOG_LEVEL: INFO
       JAVA_OPTS_APPEND: -Djava.security.krb5.conf=/etc/krb5.conf
     volumes:
-      - "${INSTALL_KEYCLOAK_CONFIG_DIR}/keycloak.keytab:/etc/keycloak/keycloak.keytab:ro"
-      - "${INSTALL_KEYCLOAK_CONFIG_DIR}/ipa-ca.crt:/etc/keycloak/ipa-ca.crt:ro"
+      - "${FREEIPA_KEYCLOAK_CONFIG_DIR}/keycloak.keytab:/etc/keycloak/keycloak.keytab:ro"
+      - "${FREEIPA_KEYCLOAK_CONFIG_DIR}/ipa-ca.crt:/etc/keycloak/ipa-ca.crt:ro"
       - "/etc/krb5.conf:/etc/krb5.conf:ro"
       - keycloak_data:/opt/keycloak/data
     ports:
-      - "172.17.0.1:${INSTALL_KEYCLOAK_PORT}:${INSTALL_KEYCLOAK_PORT}"
+      - "172.17.0.1:${FREEIPA_KEYCLOAK_PORT}:${FREEIPA_KEYCLOAK_PORT}"
     depends_on:
       postgres:
         condition: service_healthy
     networks:
       - keycloak
     extra_hosts:
-      - "${INSTALL_FQDN}:${primary_ip}"
+      - "${FREEIPA_FQDN}:${primary_ip}"
     logging:
       driver: json-file
       options:
         max-size: "50m"
         max-file: "3"
     healthcheck:
-      test: ["CMD-SHELL", "exec 3<>/dev/tcp/localhost/${INSTALL_KEYCLOAK_PORT} && printf 'GET /realms/master/.well-known/openid-configuration HTTP/1.0\\r\\nHost: localhost\\r\\n\\r\\n' >&3 && grep -q 'issuer' <&3"]
+      test:
+        - CMD-SHELL
+        - >
+          exec 3<>/dev/tcp/localhost/${FREEIPA_KEYCLOAK_PORT} &&
+          printf 'GET /realms/master/.well-known/openid-configuration HTTP/1.0\\r\\nHost: localhost\\r\\n\\r\\n' >&3 &&
+          grep -q -- 'issuer' <&3
       interval: 30s
       timeout: 10s
       retries: 10
@@ -1141,9 +1210,9 @@ volumes:
   keycloak_data:
 EOF
 
-  \chmod 600 "${INSTALL_COMPOSE_DIR}/docker-compose.yml"
+  \chmod 600 "${FREEIPA_COMPOSE_DIR}/docker-compose.yml"
 
-  __compose -f "${INSTALL_COMPOSE_DIR}/docker-compose.yml" up -d
+  __compose -f "${FREEIPA_COMPOSE_DIR}/docker-compose.yml" up -d
 
   __log "Keycloak containers started"
 }
@@ -1161,8 +1230,8 @@ __wait_for_keycloak() {
     # exists. The /health/ready path returns 404 on the main port in KC 26
     # (health lives on the management port 9000 which is not host-bound here).
     if \curl -q -LSs --max-time 5 \
-        "http://172.17.0.1:${INSTALL_KEYCLOAK_PORT}/realms/master/.well-known/openid-configuration" \
-        2>/dev/null | \grep -q '"issuer"'; then
+        "http://172.17.0.1:${FREEIPA_KEYCLOAK_PORT}/realms/master/.well-known/openid-configuration" \
+        2>/dev/null | \grep -q -- '"issuer"'; then
       __log "Keycloak is ready"
       return 0
     fi
@@ -1179,7 +1248,7 @@ __wait_for_keycloak() {
 # ─── Keycloak admin token helper ─────────────────────────────────────────────
 
 __keycloak_admin_token() {
-  local kc_url="http://172.17.0.1:${INSTALL_KEYCLOAK_PORT}"
+  local kc_url="http://172.17.0.1:${FREEIPA_KEYCLOAK_PORT}"
   local token attempt=0
   # Retry up to 6 times (60 s total) — Keycloak may still be warming up its
   # HTTP servlet even after the OIDC discovery probe passes.
@@ -1210,14 +1279,14 @@ __keycloak_admin_token() {
 __configure_keycloak() {
   __log "Configuring Keycloak realm and LDAP federation..."
 
-  local kc_url="http://172.17.0.1:${INSTALL_KEYCLOAK_PORT}"
+  local kc_url="http://172.17.0.1:${FREEIPA_KEYCLOAK_PORT}"
   local token
 
   # Step 1 — Create realm (idempotent: skip if realm already exists)
   token="$(__keycloak_admin_token)"
   local realm_exists
   realm_exists="$(\curl -q -LSs --max-time 10 \
-    "${kc_url}/admin/realms/${INSTALL_KEYCLOAK_REALM}" \
+    "${kc_url}/admin/realms/${FREEIPA_KEYCLOAK_REALM}" \
     -H "Authorization: Bearer ${token}" \
     2>/dev/null | \jq -r '.realm // empty' 2>/dev/null)"
 
@@ -1227,11 +1296,11 @@ __configure_keycloak() {
       "${kc_url}/admin/realms" \
       -H "Authorization: Bearer ${token}" \
       -H "Content-Type: application/json" \
-      -d "$(\jq -n --arg r "${INSTALL_KEYCLOAK_REALM}" --arg d "${INSTALL_DOMAIN}" \
+      -d "$(\jq -n --arg r "${FREEIPA_KEYCLOAK_REALM}" --arg d "${FREEIPA_DOMAIN}" \
         '{realm: $r, enabled: true, displayName: ("SSO — " + $d), sslRequired: "external", registrationAllowed: false, bruteForceProtected: true}')"
-    __log "Realm ${INSTALL_KEYCLOAK_REALM} created"
+    __log "Realm ${FREEIPA_KEYCLOAK_REALM} created"
   else
-    __log "Realm ${INSTALL_KEYCLOAK_REALM} already exists; skipping creation"
+    __log "Realm ${FREEIPA_KEYCLOAK_REALM} already exists; skipping creation"
   fi
 
   # Step 2 — Create LDAP user federation component (idempotent — check first)
@@ -1240,15 +1309,15 @@ __configure_keycloak() {
   # Check if freeipa-ldap component already exists
   local _existing_comp
   _existing_comp="$(\curl -q -LSs --max-time 10 \
-    "${kc_url}/admin/realms/${INSTALL_KEYCLOAK_REALM}/components?type=org.keycloak.storage.UserStorageProvider&name=freeipa-ldap" \
+    "${kc_url}/admin/realms/${FREEIPA_KEYCLOAK_REALM}/components?type=org.keycloak.storage.UserStorageProvider&name=freeipa-ldap" \
     -H "Authorization: Bearer ${token}" 2>/dev/null | \jq -r 'if type == "array" then .[0].id // empty else empty end' 2>/dev/null || true)"
 
   local ldap_body
   ldap_body="$(\jq -n \
-    --arg fqdn "${INSTALL_FQDN}" \
+    --arg fqdn "${FREEIPA_FQDN}" \
     --arg base_dn "${INSTALL_LDAP_BASE_DN}" \
     --arg ldap_pass "${INSTALL_KEYCLOAK_LDAP_PASSWORD}" \
-    --arg realm "${INSTALL_REALM}" \
+    --arg realm "${FREEIPA_REALM}" \
     --arg keytab "/etc/keycloak/keycloak.keytab" \
     '{
       name: "freeipa-ldap",
@@ -1264,7 +1333,11 @@ __configure_keycloak() {
         usernameLDAPAttribute: ["uid"],
         rdnLDAPAttribute: ["uid"],
         uuidLDAPAttribute: ["ipaUniqueID"],
-        userObjectClasses: ["inetOrgPerson, organizationalPerson"],
+        # FreeIPA user entries (including the built-in admin account) carry
+        # person/posixaccount/inetuser/krbprincipalaux, NOT inetOrgPerson or
+        # organizationalPerson — filtering on those classes matches zero
+        # FreeIPA users, so LDAP sync silently imports nobody.
+        userObjectClasses: ["person, posixaccount"],
         connectionUrl: [("ldaps://" + $fqdn + ":636")],
         usersDn: [("cn=users,cn=accounts," + $base_dn)],
         authType: ["simple"],
@@ -1293,10 +1366,19 @@ __configure_keycloak() {
   local ldap_response component_id
   if [[ -n "${_existing_comp}" && "${_existing_comp}" != "null" ]]; then
     component_id="${_existing_comp}"
-    __log "LDAP federation component already exists (id: ${component_id}); skipping creation"
+    # Update in place so config drift (e.g. a fixed bind password, a corrected
+    # userObjectClasses filter after a script upgrade) is reconciled on every
+    # re-run instead of being permanently frozen at whatever was first created.
+    \curl -q -LSs --max-time 10 -X PUT \
+      "${kc_url}/admin/realms/${FREEIPA_KEYCLOAK_REALM}/components/${component_id}" \
+      -H "Authorization: Bearer ${token}" \
+      -H "Content-Type: application/json" \
+      -d "$(printf '%s\n' "${ldap_body}" | \jq --arg id "${component_id}" '. + {id: $id}')" \
+      >/dev/null 2>/dev/null || true
+    __log "LDAP federation component already exists (id: ${component_id}); config updated"
   else
     ldap_response="$(\curl -q -LSs --max-time 10 -X POST -D - \
-      "${kc_url}/admin/realms/${INSTALL_KEYCLOAK_REALM}/components" \
+      "${kc_url}/admin/realms/${FREEIPA_KEYCLOAK_REALM}/components" \
       -H "Authorization: Bearer ${token}" \
       -H "Content-Type: application/json" \
       -d "${ldap_body}")"
@@ -1311,7 +1393,7 @@ __configure_keycloak() {
 
   # Step 3 — Trigger full LDAP sync
   \curl -q -LSs --max-time 30 -X POST \
-    "${kc_url}/admin/realms/${INSTALL_KEYCLOAK_REALM}/user-storage/${component_id}/sync?action=triggerFullSync" \
+    "${kc_url}/admin/realms/${FREEIPA_KEYCLOAK_REALM}/user-storage/${component_id}/sync?action=triggerFullSync" \
     -H "Authorization: Bearer ${token}" >/dev/null 2>/dev/null || true
 
   __log "LDAP full sync triggered"
@@ -1328,7 +1410,7 @@ __configure_keycloak() {
     fi
     local _users_resp
     _users_resp="$(\curl -q -LSs --max-time 10 \
-      "${kc_url}/admin/realms/${INSTALL_KEYCLOAK_REALM}/users?username=admin&exact=true" \
+      "${kc_url}/admin/realms/${FREEIPA_KEYCLOAK_REALM}/users?username=admin&exact=true" \
       -H "Authorization: Bearer ${token}" 2>/dev/null)"
     admin_user_id="$(printf '%s\n' "${_users_resp}" | \jq -r 'if type == "array" then .[0].id // empty else empty end' 2>/dev/null || true)"
     attempt=$(( attempt + 1 ))
@@ -1347,7 +1429,7 @@ __configure_keycloak() {
   # Get realm-management client ID
   local rm_client_id _clients_resp
   _clients_resp="$(\curl -q -LSs --max-time 10 \
-    "${kc_url}/admin/realms/${INSTALL_KEYCLOAK_REALM}/clients?clientId=realm-management" \
+    "${kc_url}/admin/realms/${FREEIPA_KEYCLOAK_REALM}/clients?clientId=realm-management" \
     -H "Authorization: Bearer ${token}" 2>/dev/null)"
   rm_client_id="$(printf '%s\n' "${_clients_resp}" | \jq -r 'if type == "array" then .[0].id // empty else empty end' 2>/dev/null || true)"
 
@@ -1359,7 +1441,7 @@ __configure_keycloak() {
   # Get realm-admin role details
   local role_info role_id role_name
   role_info="$(\curl -q -LSs --max-time 10 \
-    "${kc_url}/admin/realms/${INSTALL_KEYCLOAK_REALM}/clients/${rm_client_id}/roles/realm-admin" \
+    "${kc_url}/admin/realms/${FREEIPA_KEYCLOAK_REALM}/clients/${rm_client_id}/roles/realm-admin" \
     -H "Authorization: Bearer ${token}" 2>/dev/null)"
   role_id="$(printf '%s\n' "${role_info}" | \jq -r '.id // empty' 2>/dev/null || true)"
   role_name="$(printf '%s\n' "${role_info}" | \jq -r '.name // empty' 2>/dev/null || true)"
@@ -1371,7 +1453,7 @@ __configure_keycloak() {
 
   # Assign realm-admin role to the admin user
   \curl -q -LSs --max-time 10 -X POST \
-    "${kc_url}/admin/realms/${INSTALL_KEYCLOAK_REALM}/users/${admin_user_id}/role-mappings/clients/${rm_client_id}" \
+    "${kc_url}/admin/realms/${FREEIPA_KEYCLOAK_REALM}/users/${admin_user_id}/role-mappings/clients/${rm_client_id}" \
     -H "Authorization: Bearer ${token}" \
     -H "Content-Type: application/json" \
     -d "[$(\jq -n --arg id "${role_id}" --arg name "${role_name}" '{id: $id, name: $name}')]" >/dev/null 2>/dev/null || true
@@ -1393,25 +1475,25 @@ __configure_keycloak_nginx() {
 
   \mkdir -p /etc/nginx/vhosts.d
 
-  local vhost_file="/etc/nginx/vhosts.d/${INSTALL_FQDN}-keycloak.conf"
+  local vhost_file="/etc/nginx/vhosts.d/${FREEIPA_FQDN}-keycloak.conf"
 
   if [[ "${INSTALL_USE_LETSENCRYPT}" == "true" ]]; then
     \cat > "${vhost_file}" << EOF
 # Keycloak SSO reverse proxy — generated by install.sh
 server {
     listen 443 ssl;
-    server_name ${INSTALL_FQDN};
+    server_name ${FREEIPA_FQDN};
 
     ssl_certificate     /etc/letsencrypt/live/domain/fullchain.pem;
     ssl_certificate_key /etc/letsencrypt/live/domain/privkey.pem;
     ssl_protocols       TLSv1.2 TLSv1.3;
     ssl_ciphers         HIGH:!aNULL:!MD5;
 
-    access_log /var/log/nginx/${INSTALL_FQDN}-keycloak.access.log combined;
-    error_log  /var/log/nginx/${INSTALL_FQDN}-keycloak.error.log warn;
+    access_log /var/log/nginx/${FREEIPA_FQDN}-keycloak.access.log combined;
+    error_log  /var/log/nginx/${FREEIPA_FQDN}-keycloak.error.log warn;
 
     location / {
-        proxy_pass http://172.17.0.1:${INSTALL_KEYCLOAK_PORT};
+        proxy_pass http://172.17.0.1:${FREEIPA_KEYCLOAK_PORT};
 
         proxy_set_header Host              \$host;
         proxy_set_header X-Real-IP         \$remote_addr;
@@ -1437,13 +1519,13 @@ EOF
 #       and change the listen directive to 'listen 443 ssl;' once certificates are in place.
 server {
     listen 80;
-    server_name ${INSTALL_FQDN};
+    server_name ${FREEIPA_FQDN};
 
-    access_log /var/log/nginx/${INSTALL_FQDN}-keycloak.access.log combined;
-    error_log  /var/log/nginx/${INSTALL_FQDN}-keycloak.error.log warn;
+    access_log /var/log/nginx/${FREEIPA_FQDN}-keycloak.access.log combined;
+    error_log  /var/log/nginx/${FREEIPA_FQDN}-keycloak.error.log warn;
 
     location / {
-        proxy_pass http://172.17.0.1:${INSTALL_KEYCLOAK_PORT};
+        proxy_pass http://172.17.0.1:${FREEIPA_KEYCLOAK_PORT};
 
         proxy_set_header Host              \$host;
         proxy_set_header X-Real-IP         \$remote_addr;
@@ -1491,13 +1573,13 @@ __display_summary() {
 
   __log "FreeIPA + Keycloak Installation Summary"
   printf '==========================================\n'
-  printf 'Hostname:                  %s\n' "${INSTALL_FQDN}"
-  printf 'Domain:                    %s\n' "${INSTALL_DOMAIN}"
-  printf 'Realm:                     %s\n' "${INSTALL_REALM}"
-  printf 'Admin port:                %s\n' "${INSTALL_FREEIPA_PORT}"
+  printf 'Hostname:                  %s\n' "${FREEIPA_FQDN}"
+  printf 'Domain:                    %s\n' "${FREEIPA_DOMAIN}"
+  printf 'Realm:                     %s\n' "${FREEIPA_REALM}"
+  printf 'Admin port:                %s\n' "${FREEIPA_PORT}"
   printf 'Admin username:            admin\n'
-  printf 'Admin password:            (saved to %s)\n' "${INSTALL_CRED_FILE}"
-  printf 'Directory Manager pass:    (saved to %s)\n' "${INSTALL_CRED_FILE}"
+  printf 'Admin password:            (saved to %s)\n' "${FREEIPA_CRED_FILE}"
+  printf 'Directory Manager pass:    (saved to %s)\n' "${FREEIPA_CRED_FILE}"
   if [[ "${INSTALL_DNS}" == "true" ]]; then
     printf 'Integrated DNS:            Yes\n'
   else
@@ -1517,7 +1599,7 @@ __display_summary() {
   printf '==========================================\n\n'
 
   printf 'Access FreeIPA:\n'
-  printf '  Internal URL: https://%s:%s/ipa/ui\n' "${INSTALL_FQDN}" "${INSTALL_FREEIPA_PORT}"
+  printf '  Internal URL: https://%s:%s/ipa/ui\n' "${FREEIPA_FQDN}" "${FREEIPA_PORT}"
   printf '  (Configure your reverse proxy to forward to this URL)\n\n'
 
   printf 'Service management:\n'
@@ -1527,9 +1609,9 @@ __display_summary() {
   printf '  ipactl restart   — restart all services\n\n'
 
   printf 'Next steps:\n'
-  printf '  1. Configure your external reverse proxy to forward to https://%s:%s\n' "${INSTALL_FQDN}" "${INSTALL_FREEIPA_PORT}"
+  printf '  1. Configure your external reverse proxy to forward to https://%s:%s\n' "${FREEIPA_FQDN}" "${FREEIPA_PORT}"
   printf '  2. Access the admin interface and complete initial setup\n'
-  printf '  3. Retrieve admin and Directory Manager passwords from %s\n' "${INSTALL_CRED_FILE}"
+  printf '  3. Retrieve admin and Directory Manager passwords from %s\n' "${FREEIPA_CRED_FILE}"
   if [[ "${INSTALL_USE_LETSENCRYPT}" == "true" ]]; then
     printf '  4. Let'"'"'s Encrypt certificates will auto-renew via the installed hook\n'
   fi
@@ -1537,12 +1619,12 @@ __display_summary() {
   if [[ "${INSTALL_DNS}" == "true" ]]; then
     printf '\nDNS configuration:\n'
     printf '  Set nameserver to: %s\n' "${primary_ip}"
-    printf '  Test DNS: dig %s @%s\n' "${INSTALL_FQDN}" "${primary_ip}"
+    printf '  Test DNS: dig %s @%s\n' "${FREEIPA_FQDN}" "${primary_ip}"
   fi
 
   printf '\nNginx reverse proxy snippet:\n'
   printf '    location / {\n'
-  printf '        proxy_pass https://%s:%s;\n' "${INSTALL_FQDN}" "${INSTALL_FREEIPA_PORT}"
+  printf '        proxy_pass https://%s:%s;\n' "${FREEIPA_FQDN}" "${FREEIPA_PORT}"
   printf '        proxy_set_header Host $host;\n'
   printf '        proxy_set_header X-Real-IP $remote_addr;\n'
   printf '        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;\n'
@@ -1561,17 +1643,17 @@ __display_summary() {
   printf '  /var/log/ipaserver-install.log    — installation log\n'
   printf '  /var/log/httpd/                   — web server logs\n'
   printf '  /var/log/dirsrv/                  — directory server logs\n'
-  printf '  %s        — generated credentials\n' "${INSTALL_CRED_FILE}"
+  printf '  %s        — generated credentials\n' "${FREEIPA_CRED_FILE}"
 
   printf '\nKeycloak SSO:\n'
-  printf '  Admin console:  http://172.17.0.1:%s (internal)\n' "${INSTALL_KEYCLOAK_PORT}"
+  printf '  Admin console:  http://172.17.0.1:%s (internal)\n' "${FREEIPA_KEYCLOAK_PORT}"
   printf '  Admin user:     admin (Keycloak master realm)\n'
-  printf '  Admin pass:     (saved to %s)\n' "${INSTALL_CRED_FILE}"
-  printf '  Realm:          %s\n' "${INSTALL_KEYCLOAK_REALM}"
+  printf '  Admin pass:     (saved to %s)\n' "${FREEIPA_CRED_FILE}"
+  printf '  Realm:          %s\n' "${FREEIPA_KEYCLOAK_REALM}"
   printf '  LDAP sync:      FreeIPA → Keycloak federation active\n'
-  printf '  Kerberos SPNEGO: HTTP/%s@%s\n' "${INSTALL_FQDN}" "${INSTALL_REALM}"
-  printf '  Docker compose: %s/docker-compose.yml\n' "${INSTALL_COMPOSE_DIR}"
-  printf '  Credentials:    %s\n' "${INSTALL_CRED_FILE}"
+  printf '  Kerberos SPNEGO: HTTP/%s@%s\n' "${FREEIPA_FQDN}" "${FREEIPA_REALM}"
+  printf '  Docker compose: %s/docker-compose.yml\n' "${FREEIPA_COMPOSE_DIR}"
+  printf '  Credentials:    %s\n' "${FREEIPA_CRED_FILE}"
 }
 
 # - - - - - - - - - - - - - - - - - - - - - - - - -
@@ -1580,7 +1662,7 @@ __display_summary() {
 
 __parse_args() {
   local _opts
-  _opts="$(getopt -o hv -l help,version,debug,no-color -n "${APPNAME}" -- "$@")" || { __help; exit 2; }
+  _opts="$(getopt -o hv -l help,version,debug,color,no-color -n "${APPNAME}" -- "$@")" || { __help; exit 2; }
   eval set -- "${_opts}"
   while true; do
     case "$1" in
@@ -1593,7 +1675,16 @@ __parse_args() {
         exit 0
         ;;
       --debug)
-        INSTALL_DEBUG=1
+        FREEIPA_DEBUG=1
+        shift
+        ;;
+      --color)
+        unset NO_COLOR
+        INSTALL_COLOR_RED='\e[0;31m'
+        INSTALL_COLOR_GREEN='\e[0;32m'
+        INSTALL_COLOR_YELLOW='\e[1;33m'
+        INSTALL_COLOR_BLUE='\e[0;34m'
+        INSTALL_COLOR_RESET='\e[0m'
         shift
         ;;
       --no-color)
@@ -1630,18 +1721,20 @@ __main() {
   __detect_domain
   __check_requirements
 
-  # Load or pick stable ports for this installation — both must be set before __configure_firewall
-  INSTALL_FREEIPA_PORT="$(__load_credential "${INSTALL_CRED_FILE}" INSTALL_FREEIPA_PORT)" || {
-    INSTALL_FREEIPA_PORT="$(__random_port)"
-    __save_credential "${INSTALL_CRED_FILE}" INSTALL_FREEIPA_PORT "${INSTALL_FREEIPA_PORT}"
-  }
-  __log "Selected FreeIPA port: ${INSTALL_FREEIPA_PORT}"
+  __migrate_legacy_credential_keys "${FREEIPA_CRED_FILE}"
 
-  INSTALL_KEYCLOAK_PORT="$(__load_credential "${INSTALL_CRED_FILE}" INSTALL_KEYCLOAK_PORT)" || {
-    INSTALL_KEYCLOAK_PORT="$(__random_port)"
-    __save_credential "${INSTALL_CRED_FILE}" INSTALL_KEYCLOAK_PORT "${INSTALL_KEYCLOAK_PORT}"
+  # Load or pick stable ports for this installation — both must be set before __configure_firewall
+  FREEIPA_PORT="$(__load_credential "${FREEIPA_CRED_FILE}" FREEIPA_PORT)" || {
+    FREEIPA_PORT="$(__random_port)"
+    __save_credential "${FREEIPA_CRED_FILE}" FREEIPA_PORT "${FREEIPA_PORT}"
   }
-  __log "Selected Keycloak port: ${INSTALL_KEYCLOAK_PORT}"
+  __log "Selected FreeIPA port: ${FREEIPA_PORT}"
+
+  FREEIPA_KEYCLOAK_PORT="$(__load_credential "${FREEIPA_CRED_FILE}" FREEIPA_KEYCLOAK_PORT)" || {
+    FREEIPA_KEYCLOAK_PORT="$(__random_port)"
+    __save_credential "${FREEIPA_CRED_FILE}" FREEIPA_KEYCLOAK_PORT "${FREEIPA_KEYCLOAK_PORT}"
+  }
+  __log "Selected Keycloak port: ${FREEIPA_KEYCLOAK_PORT}"
 
   __install_prerequisites
   __configure_hosts
