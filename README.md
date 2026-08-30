@@ -37,7 +37,7 @@ bash install.sh
 10. **Deploys Keycloak via Docker Compose** — Postgres + Keycloak, with Kerberos SPNEGO wired to FreeIPA
 11. **Configures the Keycloak realm over its REST API** — creates the realm, the LDAP user federation component, triggers a full sync, and promotes the admin user to `realm-admin`
 12. **Writes an nginx vhost for Keycloak**, if nginx is installed
-13. **Installs and configures Postfix and Dovecot** — LDAP-authenticated virtual mailboxes backed by FreeIPA, with an IPA-issued, certmonger-tracked TLS certificate shared by both
+13. **Installs and configures Postfix and Dovecot** — LDAP-authenticated virtual mailboxes backed by FreeIPA, with an IPA-issued, certmonger-tracked TLS certificate shared by both. Postfix accepts mail for `FREEIPA_MAIL_DOMAIN` and any `*.FREEIPA_MAIL_DOMAIN` subdomain (via a `regexp:` virtual-domain map — Postfix has no native glob syntax). Dovecot also supports a Unix/PAM local-account fallback (tried when a user isn't found in LDAP) and Keycloak OAUTHBEARER/XOAUTH2 via token introspection for IMAP/POP3 clients that support it — both on by default, each independently toggleable
 14. Prints an installation summary with access URLs, credential locations, and next steps
 
 All steps are idempotent — re-running the script detects existing installs (FreeIPA, the Keycloak container, generated credentials) and skips them.
@@ -76,7 +76,17 @@ All steps are idempotent — re-running the script detects existing installs (Fr
 | `FREEIPA_MAIL_VUSER` | `vmail` | System user/group owning mailbox storage |
 | `FREEIPA_MAIL_VUID` | `5000` | UID for `FREEIPA_MAIL_VUSER` |
 | `FREEIPA_MAIL_VGID` | `5000` | GID for `FREEIPA_MAIL_VUSER` |
+| `FREEIPA_MAIL_LOCAL_FALLBACK` | `true` | Add a Unix/PAM passdb tried when a user isn't found in LDAP |
+| `FREEIPA_MAIL_KEYCLOAK_AUTH` | `true` | Add a Keycloak OAUTHBEARER/XOAUTH2 passdb (IMAP/POP3 only) |
 | `NO_COLOR` | unset | Disable color output when set |
+
+**Keycloak mail client note:** the confidential `dovecot-mail` client created for
+token introspection only authenticates Dovecot to Keycloak — it does not issue
+user tokens. A mail client (MUA) must obtain its access token through its own
+Keycloak client, and that client needs an **audience mapper** targeting
+`FREEIPA_MAIL_KEYCLOAK_CLIENT_ID` (`dovecot-mail` by default) so the token's
+`aud` claim includes it — Keycloak's introspection endpoint reports tokens
+without a matching audience as inactive.
 
 ---
 
@@ -94,7 +104,7 @@ FREEIPA_OTP="$(ipa host-add client.example.com --random | grep -oP '(?<=Random p
 ```
 
 Prefer `FREEIPA_OTP` (a single-use host password from `ipa host-add --random`,
-generated on the server) over `INSTALL_ADMIN_PASSWORD` — `ipa-client-install`
+generated on the server) over `FREEIPA_ADMIN_PASSWORD` — `ipa-client-install`
 has no stdin input for its password flag, so whichever secret is used is briefly
 visible via process arguments; an OTP only grants that one host's enrollment.
 
@@ -141,8 +151,8 @@ authentication (not NSS-based lookups).
 | `FREEIPA_DOMAIN` | auto-detected | Override the detected domain |
 | `FREEIPA_REALM` | auto-detected | Override the detected Kerberos realm |
 | `FREEIPA_CRED_FILE` | `/root/.freeipa-client.conf` | Enrollment record path |
-| `INSTALL_ADMIN_PRINCIPAL` | `admin` | Enrollment principal |
-| `INSTALL_ADMIN_PASSWORD` | unset | Enrollment principal's password (prompted if unset) |
+| `FREEIPA_ADMIN_PRINCIPAL` | `admin` | Enrollment principal |
+| `FREEIPA_ADMIN_PASSWORD` | unset | Enrollment principal's password (prompted if unset) |
 | `FREEIPA_OTP` | unset | One-time host password — recommended over the admin password |
 | `FREEIPA_CA_SHA256` | unset | Expected CA cert SHA-256 fingerprint (Alpine path only) |
 | `NO_COLOR` | unset | Disable color output when set |

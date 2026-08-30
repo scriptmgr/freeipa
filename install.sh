@@ -87,6 +87,10 @@ FREEIPA_MAIL_VGID="${FREEIPA_MAIL_VGID:-5000}"
 INSTALL_MAIL_LDAP_PASSWORD=""
 INSTALL_MAIL_CERT_PATH=""
 INSTALL_MAIL_KEY_PATH=""
+FREEIPA_MAIL_LOCAL_FALLBACK="${FREEIPA_MAIL_LOCAL_FALLBACK:-true}"
+FREEIPA_MAIL_KEYCLOAK_AUTH="${FREEIPA_MAIL_KEYCLOAK_AUTH:-true}"
+FREEIPA_MAIL_KEYCLOAK_CLIENT_ID="${FREEIPA_MAIL_KEYCLOAK_CLIENT_ID:-dovecot-mail}"
+INSTALL_MAIL_KEYCLOAK_SECRET=""
 # - - - - - - - - - - - - - - - - - - - - - - - - -
 
 # ─── Standard Utility Functions ──────────────────────────────────────────────
@@ -350,6 +354,12 @@ __detect_domain() {
     FREEIPA_REALM="${FREEIPA_DOMAIN^^}"
     FREEIPA_FQDN="${FREEIPA_FQDN}.${FREEIPA_DOMAIN}"
   fi
+
+  # DNS/LDAP hostnames and domains are lowercase by convention (and Kerberos
+  # realms uppercase) regardless of how the caller cased an env override
+  FREEIPA_FQDN="${FREEIPA_FQDN,,}"
+  FREEIPA_DOMAIN="${FREEIPA_DOMAIN,,}"
+  FREEIPA_REALM="${FREEIPA_REALM^^}"
 
   __log "Using hostname: ${FREEIPA_FQDN}"
   __log "Using domain:   ${FREEIPA_DOMAIN}"
@@ -1489,6 +1499,67 @@ __configure_keycloak() {
 
 # - - - - - - - - - - - - - - - - - - - - - - - - -
 
+# ─── Keycloak confidential client for Dovecot OAuth2 introspection ───────────
+
+__configure_keycloak_mail_client() {
+  if [[ "${FREEIPA_MAIL_KEYCLOAK_AUTH}" != "true" ]]; then
+    __log "Keycloak mail auth disabled (FREEIPA_MAIL_KEYCLOAK_AUTH=false); skipping"
+    return 0
+  fi
+
+  __log "Configuring Keycloak confidential client for Dovecot token introspection..."
+
+  local kc_url="http://172.17.0.1:${FREEIPA_KEYCLOAK_PORT}"
+  local token
+  token="$(__keycloak_admin_token)"
+
+  INSTALL_MAIL_KEYCLOAK_SECRET="$(__load_credential "${FREEIPA_CRED_FILE}" INSTALL_MAIL_KEYCLOAK_SECRET)" || {
+    INSTALL_MAIL_KEYCLOAK_SECRET="$(__random_password 32)"
+    __save_credential "${FREEIPA_CRED_FILE}" INSTALL_MAIL_KEYCLOAK_SECRET "${INSTALL_MAIL_KEYCLOAK_SECRET}"
+  }
+
+  local existing_client_id
+  existing_client_id="$(\curl -q -LSs --max-time 10 \
+    "${kc_url}/admin/realms/${FREEIPA_KEYCLOAK_REALM}/clients?clientId=${FREEIPA_MAIL_KEYCLOAK_CLIENT_ID}" \
+    -H "Authorization: Bearer ${token}" 2>/dev/null | \jq -r 'if type == "array" then .[0].id // empty else empty end' 2>/dev/null || true)"
+
+  local client_body
+  client_body="$(\jq -n \
+    --arg cid "${FREEIPA_MAIL_KEYCLOAK_CLIENT_ID}" \
+    --arg secret "${INSTALL_MAIL_KEYCLOAK_SECRET}" \
+    '{
+      clientId: $cid,
+      enabled: true,
+      protocol: "openid-connect",
+      publicClient: false,
+      standardFlowEnabled: false,
+      directAccessGrantsEnabled: false,
+      serviceAccountsEnabled: true,
+      secret: $secret
+    }')"
+
+  if [[ -n "${existing_client_id}" && "${existing_client_id}" != "null" ]]; then
+    \curl -q -LSs --max-time 10 -X PUT \
+      "${kc_url}/admin/realms/${FREEIPA_KEYCLOAK_REALM}/clients/${existing_client_id}" \
+      -H "Authorization: Bearer ${token}" \
+      -H "Content-Type: application/json" \
+      -d "$(printf '%s\n' "${client_body}" | \jq --arg id "${existing_client_id}" '. + {id: $id}')" \
+      >/dev/null 2>/dev/null || true
+    __log "Keycloak mail client ${FREEIPA_MAIL_KEYCLOAK_CLIENT_ID} already exists; config updated"
+  else
+    \curl -q -LSs --max-time 10 -X POST \
+      "${kc_url}/admin/realms/${FREEIPA_KEYCLOAK_REALM}/clients" \
+      -H "Authorization: Bearer ${token}" \
+      -H "Content-Type: application/json" \
+      -d "${client_body}" >/dev/null 2>/dev/null || true
+    __log "Keycloak mail client ${FREEIPA_MAIL_KEYCLOAK_CLIENT_ID} created"
+  fi
+
+  __log "Keycloak mail client configured"
+}
+
+# - - - - - - - - - - - - - - - - - - - - - - - - -
+
 # ─── Keycloak nginx vhost ─────────────────────────────────────────────────────
 
 __configure_keycloak_nginx() {
@@ -1751,6 +1822,7 @@ __configure_postfix() {
     printf 'server_port = 389\n'
     printf 'start_tls = yes\n'
     printf 'tls_ca_cert_file = /etc/ipa/ca.crt\n'
+    printf 'version = 3\n'
     printf 'bind = yes\n'
     printf 'bind_dn = uid=mail,cn=sysaccounts,cn=etc,%s\n' "${INSTALL_LDAP_BASE_DN}"
     printf 'bind_pw = %s\n' "${INSTALL_MAIL_LDAP_PASSWORD}"
@@ -1767,6 +1839,7 @@ __configure_postfix() {
     printf 'server_port = 389\n'
     printf 'start_tls = yes\n'
     printf 'tls_ca_cert_file = /etc/ipa/ca.crt\n'
+    printf 'version = 3\n'
     printf 'bind = yes\n'
     printf 'bind_dn = uid=mail,cn=sysaccounts,cn=etc,%s\n' "${INSTALL_LDAP_BASE_DN}"
     printf 'bind_pw = %s\n' "${INSTALL_MAIL_LDAP_PASSWORD}"
@@ -1777,6 +1850,14 @@ __configure_postfix() {
   } > /etc/postfix/ldap/virtual-alias.cf
   \chown root:postfix /etc/postfix/ldap/virtual-alias.cf
   \chmod 640 /etc/postfix/ldap/virtual-alias.cf
+
+  # Postfix's virtual_mailbox_domains takes a literal list or a lookup table —
+  # it has no built-in glob/wildcard syntax — so a regexp: map is the correct
+  # way to accept both the exact domain and any *.{domain} subdomain
+  local mail_domain_regex="${FREEIPA_MAIL_DOMAIN//./\\.}"
+  printf '/^([^@]+\\.)?%s$/    OK\n' "${mail_domain_regex}" > /etc/postfix/regexp-virtual-domains
+  \chown root:postfix /etc/postfix/regexp-virtual-domains
+  \chmod 640 /etc/postfix/regexp-virtual-domains
 
   local marker_begin="# --- scriptmgr-freeipa mail block (begin) ---"
   local marker_end="# --- scriptmgr-freeipa mail block (end) ---"
@@ -1794,7 +1875,7 @@ __configure_postfix() {
 
   {
     printf '%s\n' "${marker_begin}"
-    printf 'virtual_mailbox_domains = %s\n' "${FREEIPA_MAIL_DOMAIN}"
+    printf 'virtual_mailbox_domains = regexp:/etc/postfix/regexp-virtual-domains\n'
     printf 'virtual_mailbox_base = %s\n' "${FREEIPA_MAIL_BASE_DIR}"
     printf 'virtual_mailbox_maps = ldap:/etc/postfix/ldap/virtual-mailbox.cf\n'
     printf 'virtual_alias_maps = ldap:/etc/postfix/ldap/virtual-alias.cf\n'
@@ -1854,11 +1935,20 @@ __configure_postfix() {
 __configure_dovecot() {
   __log "Configuring Dovecot..."
 
-  # Disable the distro-default system passdb/userdb include so FreeIPA LDAP
-  # is the only credential source — safe to re-run, matches only when active
+  # Disable the distro-default system passdb/userdb include — our own block
+  # below adds the local Unix fallback explicitly (via pam/passwd) instead,
+  # so FreeIPA LDAP stays authoritative and tried first
   if [[ -f /etc/dovecot/conf.d/10-auth.conf ]]; then
     \sed -i 's/^!include auth-system.conf.ext/#!include auth-system.conf.ext/' \
       /etc/dovecot/conf.d/10-auth.conf
+  fi
+
+  if [[ "${FREEIPA_MAIL_LOCAL_FALLBACK}" == "true" && ! -f /etc/pam.d/dovecot ]]; then
+    {
+      printf '#%%PAM-1.0\n'
+      printf 'auth    required        pam_unix.so\n'
+      printf 'account required        pam_unix.so\n'
+    } > /etc/pam.d/dovecot
   fi
 
   {
@@ -1882,6 +1972,41 @@ __configure_dovecot() {
   \chown root:dovecot /etc/dovecot/dovecot-ldap.conf.ext
   \chmod 640 /etc/dovecot/dovecot-ldap.conf.ext
 
+  local auth_mechanisms="plain login"
+  local passdb_blocks userdb_blocks
+  # Command substitution strips trailing newlines, so each block ends with an
+  # explicit newline appended outside $(...) — otherwise concatenated blocks
+  # glue together onto one line and dovecot.conf fails to parse
+  passdb_blocks="$(printf 'passdb {\n  driver = ldap\n  args = /etc/dovecot/dovecot-ldap.conf.ext\n}')"$'\n'
+  userdb_blocks="$(printf 'userdb {\n  driver = ldap\n  args = /etc/dovecot/dovecot-ldap.conf.ext\n}')"$'\n'
+
+  # Local Unix fallback — tried only when LDAP reports the user as unknown,
+  # so FreeIPA-directory users always authenticate via LDAP first
+  if [[ "${FREEIPA_MAIL_LOCAL_FALLBACK}" == "true" ]]; then
+    passdb_blocks+="$(printf 'passdb {\n  driver = pam\n  args = dovecot\n}')"$'\n'
+    userdb_blocks+="$(printf 'userdb {\n  driver = passwd\n  override_fields = mail=maildir:~/Maildir\n}')"$'\n'
+  fi
+
+  # Keycloak OAuth2 token introspection — scoped to oauthbearer/xoauth2 only,
+  # so plain/login clients keep going through LDAP (and local) above
+  if [[ "${FREEIPA_MAIL_KEYCLOAK_AUTH}" == "true" ]]; then
+    auth_mechanisms+=" oauthbearer xoauth2"
+    {
+      printf 'introspection_url = http://172.17.0.1:%s/realms/%s/protocol/openid-connect/token/introspect\n' \
+        "${FREEIPA_KEYCLOAK_PORT}" "${FREEIPA_KEYCLOAK_REALM}"
+      printf 'introspection_mode = post\n'
+      printf 'client_id = %s\n' "${FREEIPA_MAIL_KEYCLOAK_CLIENT_ID}"
+      printf 'client_secret = %s\n' "${INSTALL_MAIL_KEYCLOAK_SECRET}"
+      printf 'username_attribute = preferred_username\n'
+      printf 'active_attribute = active\n'
+      printf 'active_value = true\n'
+    } > /etc/dovecot/dovecot-oauth2.conf.ext
+    \chown root:dovecot /etc/dovecot/dovecot-oauth2.conf.ext
+    \chmod 640 /etc/dovecot/dovecot-oauth2.conf.ext
+
+    passdb_blocks+="$(printf 'passdb {\n  driver = oauth2\n  mechanisms = xoauth2 oauthbearer\n  args = /etc/dovecot/dovecot-oauth2.conf.ext\n}')"$'\n'
+  fi
+
   local marker_begin="# --- scriptmgr-freeipa mail block (begin) ---"
   local marker_end="# --- scriptmgr-freeipa mail block (end) ---"
 
@@ -1891,9 +2016,9 @@ __configure_dovecot() {
     printf '%s\n' "${marker_begin}"
     printf 'mail_location = maildir:%s/%%d/%%n\n' "${FREEIPA_MAIL_BASE_DIR}"
     printf 'disable_plaintext_auth = yes\n'
-    printf 'auth_mechanisms = plain login\n'
-    printf 'passdb {\n  driver = ldap\n  args = /etc/dovecot/dovecot-ldap.conf.ext\n}\n'
-    printf 'userdb {\n  driver = ldap\n  args = /etc/dovecot/dovecot-ldap.conf.ext\n}\n'
+    printf 'auth_mechanisms = %s\n' "${auth_mechanisms}"
+    printf '%s' "${passdb_blocks}"
+    printf '%s' "${userdb_blocks}"
     printf 'ssl = required\n'
     printf 'ssl_cert = <%s\n' "${INSTALL_MAIL_CERT_PATH}"
     printf 'ssl_key = <%s\n' "${INSTALL_MAIL_KEY_PATH}"
@@ -2002,12 +2127,18 @@ __display_summary() {
   printf '  Credentials:    %s\n' "${FREEIPA_CRED_FILE}"
 
   printf '\nMail (Postfix/Dovecot):\n'
-  printf '  Domain:           %s\n' "${FREEIPA_MAIL_DOMAIN}"
+  printf '  Domain:           %s (and *.%s)\n' "${FREEIPA_MAIL_DOMAIN}" "${FREEIPA_MAIL_DOMAIN}"
   printf '  SMTP (STARTTLS):  %s:587\n' "${FREEIPA_FQDN}"
   printf '  SMTPS:            %s:465\n' "${FREEIPA_FQDN}"
   printf '  IMAP (TLS):       %s:993\n' "${FREEIPA_FQDN}"
   printf '  POP3 (TLS):       %s:995\n' "${FREEIPA_FQDN}"
-  printf '  Auth:             FreeIPA LDAP bind — any posixAccount user with a mail attribute\n'
+  printf '  Auth (LDAP):      FreeIPA LDAP bind — any posixAccount user with a mail attribute\n'
+  if [[ "${FREEIPA_MAIL_LOCAL_FALLBACK}" == "true" ]]; then
+    printf '  Auth (local):     Unix/PAM fallback for non-LDAP accounts (plain/login only)\n'
+  fi
+  if [[ "${FREEIPA_MAIL_KEYCLOAK_AUTH}" == "true" ]]; then
+    printf '  Auth (Keycloak):  OAUTHBEARER/XOAUTH2 via token introspection (IMAP/POP3 only)\n'
+  fi
   printf '  Mailbox storage:  %s/%s/<uid>\n' "${FREEIPA_MAIL_BASE_DIR}" "${FREEIPA_MAIL_DOMAIN}"
   printf '  TLS certificate:  FreeIPA-issued, tracked by certmonger (auto-renews)\n'
 }
@@ -2111,6 +2242,7 @@ __main() {
   __create_initial_objects
   __install_mail_packages
   __setup_freeipa_for_mail
+  __configure_keycloak_mail_client
   __create_mail_storage
   __configure_postfix
   __configure_dovecot

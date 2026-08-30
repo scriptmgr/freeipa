@@ -53,8 +53,8 @@ FREEIPA_REALM="${FREEIPA_REALM:-}"
 FREEIPA_SERVER="${FREEIPA_SERVER:-}"
 FREEIPA_SERVER_IP="${FREEIPA_SERVER_IP:-}"
 FREEIPA_CRED_FILE="${FREEIPA_CRED_FILE:-/root/.freeipa-client.conf}"
-INSTALL_ADMIN_PRINCIPAL="${INSTALL_ADMIN_PRINCIPAL:-admin}"
-INSTALL_ADMIN_PASSWORD="${INSTALL_ADMIN_PASSWORD:-}"
+FREEIPA_ADMIN_PRINCIPAL="${FREEIPA_ADMIN_PRINCIPAL:-admin}"
+FREEIPA_ADMIN_PASSWORD="${FREEIPA_ADMIN_PASSWORD:-}"
 FREEIPA_OTP="${FREEIPA_OTP:-}"
 FREEIPA_CA_SHA256="${FREEIPA_CA_SHA256:-}"
 INSTALL_FORCE_JOIN="false"
@@ -164,8 +164,8 @@ __help() {
   printf '  FREEIPA_DOMAIN           Override auto-detected domain\n'
   printf '  FREEIPA_REALM            Override auto-detected Kerberos realm\n'
   printf '  FREEIPA_CRED_FILE        Enrollment record path (default: /root/.freeipa-client.conf)\n'
-  printf '  INSTALL_ADMIN_PRINCIPAL  Enrollment principal (default: admin)\n'
-  printf '  INSTALL_ADMIN_PASSWORD   Enrollment principal'"'"'s password (prompted if unset)\n'
+  printf '  FREEIPA_ADMIN_PRINCIPAL  Enrollment principal (default: admin)\n'
+  printf '  FREEIPA_ADMIN_PASSWORD   Enrollment principal'"'"'s password (prompted if unset)\n'
   printf '  FREEIPA_OTP              One-time host password (recommended over the admin\n'
   printf '                           password — generate on the server with:\n'
   printf '                           ipa host-add <fqdn> --random)\n'
@@ -203,12 +203,12 @@ __check_args() {
   if [[ -n "${FREEIPA_OTP}" ]]; then
     return 0
   fi
-  if [[ -z "${INSTALL_ADMIN_PASSWORD}" ]]; then
+  if [[ -z "${FREEIPA_ADMIN_PASSWORD}" ]]; then
     if [[ -t 0 ]]; then
-      read -r -s -p "Password for ${INSTALL_ADMIN_PRINCIPAL}@${FREEIPA_SERVER}: " INSTALL_ADMIN_PASSWORD
+      read -r -s -p "Password for ${FREEIPA_ADMIN_PRINCIPAL}@${FREEIPA_SERVER}: " FREEIPA_ADMIN_PASSWORD
       printf '\n'
     else
-      __error "INSTALL_ADMIN_PASSWORD or FREEIPA_OTP is required in non-interactive mode"
+      __error "FREEIPA_ADMIN_PASSWORD or FREEIPA_OTP is required in non-interactive mode"
     fi
   fi
 }
@@ -246,18 +246,29 @@ __detect_distro() {
 __configure_hostname() {
   FREEIPA_FQDN="${FREEIPA_FQDN:-$(__determine_hostname_name 2>/dev/null || \hostname)}"
 
+  # DNS hostnames and domains are lowercase by convention regardless of how
+  # the caller cased an env override; normalize before any suffix/comparison
+  # logic below so a mixed-case FQDN and domain still match correctly
+  FREEIPA_FQDN="${FREEIPA_FQDN,,}"
+  FREEIPA_DOMAIN="${FREEIPA_DOMAIN,,}"
+
   if [[ "${FREEIPA_FQDN}" != *.* ]]; then
     if [[ -n "${FREEIPA_DOMAIN}" ]]; then
       FREEIPA_FQDN="${FREEIPA_FQDN}.${FREEIPA_DOMAIN}"
     else
       FREEIPA_FQDN="${FREEIPA_FQDN}.$(__determine_domain_name 2>/dev/null || printf '%s' "${FREEIPA_SERVER#*.}")"
     fi
+    FREEIPA_FQDN="${FREEIPA_FQDN,,}"
     __log "Hostname was not fully qualified; using ${FREEIPA_FQDN}"
     \hostnamectl set-hostname "${FREEIPA_FQDN}"
   fi
 
   FREEIPA_DOMAIN="${FREEIPA_DOMAIN:-${FREEIPA_FQDN#*.}}"
   FREEIPA_REALM="${FREEIPA_REALM:-$(printf '%s' "${FREEIPA_DOMAIN}" | \tr '[:lower:]' '[:upper:]')}"
+
+  # Kerberos realms are uppercase by convention regardless of how the caller
+  # cased an env override
+  FREEIPA_REALM="${FREEIPA_REALM^^}"
 
   __log "Using hostname: ${FREEIPA_FQDN}"
   __log "Using domain:   ${FREEIPA_DOMAIN}"
@@ -335,8 +346,8 @@ __enroll_client() {
   # for --password (Python getpass() reads /dev/tty, not stdin), so either
   # value is briefly visible via /proc/<pid>/cmdline while the process runs;
   # an OTP only grants that one host's enrollment, unlike the admin password.
-  local join_principal="${INSTALL_ADMIN_PRINCIPAL}"
-  local join_secret="${INSTALL_ADMIN_PASSWORD}"
+  local join_principal="${FREEIPA_ADMIN_PRINCIPAL}"
+  local join_secret="${FREEIPA_ADMIN_PASSWORD}"
   if [[ -n "${FREEIPA_OTP}" ]]; then
     __log "Using a one-time host password for enrollment instead of the admin credential"
     join_principal=""
@@ -376,10 +387,10 @@ __enroll_client() {
 __verify_enrollment() {
   __log "Verifying enrollment..."
 
-  if \getent passwd "${INSTALL_ADMIN_PRINCIPAL}" >/dev/null 2>&1; then
-    __log "SSSD resolves ${INSTALL_ADMIN_PRINCIPAL} via the directory"
+  if \getent passwd "${FREEIPA_ADMIN_PRINCIPAL}" >/dev/null 2>&1; then
+    __log "SSSD resolves ${FREEIPA_ADMIN_PRINCIPAL} via the directory"
   else
-    __warn "getent could not resolve ${INSTALL_ADMIN_PRINCIPAL}; SSSD may still be starting"
+    __warn "getent could not resolve ${FREEIPA_ADMIN_PRINCIPAL}; SSSD may still be starting"
   fi
 
   if \kinit -k "host/${FREEIPA_FQDN}" 2>/dev/null; then
@@ -491,7 +502,7 @@ __enroll_alpine_client() {
     __log "NSS-based getent/id/login will not work on musl regardless of this config"
   fi
 
-  __log "krb5 configured — 'kinit ${INSTALL_ADMIN_PRINCIPAL}' authenticates against ${FREEIPA_SERVER}"
+  __log "krb5 configured — 'kinit ${FREEIPA_ADMIN_PRINCIPAL}' authenticates against ${FREEIPA_SERVER}"
   __save_credential "${FREEIPA_CRED_FILE}" FREEIPA_SERVER "${FREEIPA_SERVER}"
   __save_credential "${FREEIPA_CRED_FILE}" FREEIPA_DOMAIN "${FREEIPA_DOMAIN}"
   __save_credential "${FREEIPA_CRED_FILE}" FREEIPA_REALM "${FREEIPA_REALM}"
@@ -576,7 +587,7 @@ __parse_args() {
         shift 2
         ;;
       --principal)
-        INSTALL_ADMIN_PRINCIPAL="$2"
+        FREEIPA_ADMIN_PRINCIPAL="$2"
         shift 2
         ;;
       --)
