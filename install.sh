@@ -113,7 +113,10 @@ __random_password() {
   # tr reads /dev/urandom infinitely; head closes the pipe after N bytes, sending
   # SIGPIPE to tr. Run tr in a subshell and absorb the SIGPIPE with || true so
   # set -o pipefail does not propagate tr's exit 141 to the caller.
-  ( \tr -dc 'A-Za-z0-9!@#$%^&*_+-' </dev/urandom 2>/dev/null || true ) | \head -c "${length}"
+  # Excludes '#': Dovecot's config parser treats an unescaped '#' as a
+  # comment start even mid-line (confirmed breaking dovecot-ldap.conf.ext's
+  # dnpass), silently truncating any password that contains one.
+  ( \tr -dc 'A-Za-z0-9!@$%^&*_+-' </dev/urandom 2>/dev/null || true ) | \head -c "${length}"
   printf '\n'
 }
 
