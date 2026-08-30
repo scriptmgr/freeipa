@@ -1,6 +1,6 @@
 # freeipa
 
-Full [FreeIPA](https://www.freeipa.org/) + [Keycloak](https://www.keycloak.org/) SSO bootstrap for any major Linux distribution — installs FreeIPA with DNS, NTP, and firewall configuration, then deploys Keycloak via Docker and federates it against FreeIPA LDAP for centralized single sign-on. Idempotent and non-interactive.
+Full [FreeIPA](https://www.freeipa.org/) + [Keycloak](https://www.keycloak.org/) SSO bootstrap for any major Linux distribution — installs FreeIPA with DNS, NTP, and firewall configuration, then deploys Keycloak via Docker and federates it against FreeIPA LDAP for centralized single sign-on. Also configures Postfix and Dovecot for LDAP/TLS-authenticated mail against the same FreeIPA directory. Idempotent and non-interactive.
 
 ---
 
@@ -37,7 +37,8 @@ bash install.sh
 10. **Deploys Keycloak via Docker Compose** — Postgres + Keycloak, with Kerberos SPNEGO wired to FreeIPA
 11. **Configures the Keycloak realm over its REST API** — creates the realm, the LDAP user federation component, triggers a full sync, and promotes the admin user to `realm-admin`
 12. **Writes an nginx vhost for Keycloak**, if nginx is installed
-13. Prints an installation summary with access URLs, credential locations, and next steps
+13. **Installs and configures Postfix and Dovecot** — LDAP-authenticated virtual mailboxes backed by FreeIPA, with an IPA-issued, certmonger-tracked TLS certificate shared by both
+14. Prints an installation summary with access URLs, credential locations, and next steps
 
 All steps are idempotent — re-running the script detects existing installs (FreeIPA, the Keycloak container, generated credentials) and skips them.
 
@@ -70,6 +71,11 @@ All steps are idempotent — re-running the script detects existing installs (Fr
 | `FREEIPA_KEYCLOAK_REALM` | domain name | Keycloak realm name |
 | `FREEIPA_COMPOSE_DIR` | `/opt/keycloak` | Docker Compose directory |
 | `FREEIPA_KEYCLOAK_CONFIG_DIR` | `/etc/keycloak` | Keycloak keytab/CA config directory |
+| `FREEIPA_MAIL_DOMAIN` | `FREEIPA_DOMAIN` | Mail domain for virtual mailboxes |
+| `FREEIPA_MAIL_BASE_DIR` | `/var/mail/vhosts` | Maildir storage root |
+| `FREEIPA_MAIL_VUSER` | `vmail` | System user/group owning mailbox storage |
+| `FREEIPA_MAIL_VUID` | `5000` | UID for `FREEIPA_MAIL_VUSER` |
+| `FREEIPA_MAIL_VGID` | `5000` | GID for `FREEIPA_MAIL_VUSER` |
 | `NO_COLOR` | unset | Disable color output when set |
 
 ---

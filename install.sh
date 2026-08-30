@@ -78,6 +78,16 @@ FREEIPA_COMPOSE_DIR="${FREEIPA_COMPOSE_DIR:-/opt/keycloak}"
 FREEIPA_KEYCLOAK_CONFIG_DIR="${FREEIPA_KEYCLOAK_CONFIG_DIR:-/etc/keycloak}"
 INSTALL_LDIF_TMP=""
 # - - - - - - - - - - - - - - - - - - - - - - - - -
+# Mail (Postfix/Dovecot) globals
+FREEIPA_MAIL_DOMAIN="${FREEIPA_MAIL_DOMAIN:-}"
+FREEIPA_MAIL_BASE_DIR="${FREEIPA_MAIL_BASE_DIR:-/var/mail/vhosts}"
+FREEIPA_MAIL_VUSER="${FREEIPA_MAIL_VUSER:-vmail}"
+FREEIPA_MAIL_VUID="${FREEIPA_MAIL_VUID:-5000}"
+FREEIPA_MAIL_VGID="${FREEIPA_MAIL_VGID:-5000}"
+INSTALL_MAIL_LDAP_PASSWORD=""
+INSTALL_MAIL_CERT_PATH=""
+INSTALL_MAIL_KEY_PATH=""
+# - - - - - - - - - - - - - - - - - - - - - - - - -
 
 # ─── Standard Utility Functions ──────────────────────────────────────────────
 
@@ -367,7 +377,7 @@ __install_packages() {
 
     *debian*|*ubuntu*)
       __log "Installing FreeIPA packages via apt-get..."
-      INSTALL_DEBIAN_FRONTEND="noninteractive"
+      local INSTALL_DEBIAN_FRONTEND="noninteractive"
       export DEBIAN_FRONTEND="${INSTALL_DEBIAN_FRONTEND}"
       \apt-get update
       \apt-get install -y freeipa-server freeipa-server-dns freeipa-server-trust-ad bind9-utils dnsutils chrony ufw ldap-utils
@@ -616,6 +626,14 @@ __configure_firewall() {
 
     # Keycloak port (internal Docker bridge — open for reverse proxy reach)
     \firewall-cmd --permanent --add-port="${FREEIPA_KEYCLOAK_PORT}/tcp"
+    # Mail (Postfix/Dovecot)
+    \firewall-cmd --permanent --add-service=smtp
+    \firewall-cmd --permanent --add-port=587/tcp
+    \firewall-cmd --permanent --add-port=465/tcp
+    \firewall-cmd --permanent --add-service=imap
+    \firewall-cmd --permanent --add-service=imaps
+    \firewall-cmd --permanent --add-service=pop3
+    \firewall-cmd --permanent --add-service=pop3s
     # Mosh server uses UDP 60000-61000 for encrypted remote terminal sessions
     \firewall-cmd --permanent --add-port=60000-61000/udp
     # Allow ICMP ping for monitoring
@@ -659,6 +677,14 @@ __configure_firewall() {
 
     # Keycloak port
     \ufw allow "${FREEIPA_KEYCLOAK_PORT}/tcp"
+    # Mail (Postfix/Dovecot)
+    \ufw allow 25/tcp
+    \ufw allow 587/tcp
+    \ufw allow 465/tcp
+    \ufw allow 143/tcp
+    \ufw allow 993/tcp
+    \ufw allow 110/tcp
+    \ufw allow 995/tcp
     # Mosh server uses UDP 60000-61000 for encrypted remote terminal sessions
     \ufw allow 60000:61000/udp
     # Allow ICMP ping — inject into before.rules if not already present
@@ -1565,6 +1591,326 @@ __create_initial_objects() {
 
 # - - - - - - - - - - - - - - - - - - - - - - - - -
 
+# ─── Mail (Postfix/Dovecot) package installation ─────────────────────────────
+
+__install_mail_packages() {
+  if \command -v postfix >/dev/null 2>&1 && \command -v dovecot >/dev/null 2>&1; then
+    __log "Postfix and Dovecot already installed; skipping"
+    return 0
+  fi
+
+  __log "Installing Postfix and Dovecot..."
+
+  case "${INSTALL_DISTRO_FAMILY}" in
+    *rhel*|*fedora*|*centos*)
+      \dnf install -y postfix postfix-ldap dovecot dovecot-pigeonhole
+      ;;
+    *debian*|*ubuntu*)
+      \apt-get install -y postfix postfix-ldap dovecot-core dovecot-imapd dovecot-pop3d dovecot-lmtpd dovecot-ldap
+      ;;
+    *suse*)
+      \zypper install -y postfix postfix-ldap dovecot dovecot-backend-ldap
+      ;;
+    *)
+      __error "Unsupported distribution family for mail package install: ${INSTALL_DISTRO_FAMILY}"
+      ;;
+  esac
+
+  __log "Postfix and Dovecot installed"
+}
+
+# - - - - - - - - - - - - - - - - - - - - - - - - -
+
+# ─── FreeIPA post-config for Mail ─────────────────────────────────────────────
+
+__setup_freeipa_for_mail() {
+  __log "Configuring FreeIPA for Postfix/Dovecot LDAP integration..."
+
+  FREEIPA_MAIL_DOMAIN="${FREEIPA_MAIL_DOMAIN:-${FREEIPA_DOMAIN}}"
+
+  # Load or generate the mail LDAP bind password — used only for read-only
+  # LDAP lookups; actual user password checks happen via auth_bind against
+  # the user's own DN, so FreeIPA's Kerberos-backed password stays authoritative
+  INSTALL_MAIL_LDAP_PASSWORD="$(__load_credential "${FREEIPA_CRED_FILE}" INSTALL_MAIL_LDAP_PASSWORD)" || {
+    INSTALL_MAIL_LDAP_PASSWORD="$(__random_password 32)"
+    __save_credential "${FREEIPA_CRED_FILE}" INSTALL_MAIL_LDAP_PASSWORD "${INSTALL_MAIL_LDAP_PASSWORD}"
+  }
+
+  # Obtain a Kerberos ticket for the admin user
+  printf '%s\n' "${INSTALL_ADMIN_PASSWORD}" | \kinit "admin@${FREEIPA_REALM}"
+
+  \mkdir -p "${TMPDIR:-/tmp}/scriptmgr"
+  INSTALL_LDIF_TMP="$(\mktemp "${TMPDIR:-/tmp}/scriptmgr/freeipa-mail-XXXXXX.ldif")"
+
+  {
+    printf 'dn: uid=mail,cn=sysaccounts,cn=etc,%s\n' "${INSTALL_LDAP_BASE_DN}"
+    printf 'objectClass: account\n'
+    printf 'objectClass: simplesecurityobject\n'
+    printf 'uid: mail\n'
+    printf 'userPassword: {CLEAR}%s\n' "${INSTALL_MAIL_LDAP_PASSWORD}"
+    printf 'passwordExpirationTime: 20380119031407Z\n'
+    printf 'nsIdleTimeout: 0\n'
+  } > "${INSTALL_LDIF_TMP}"
+
+  # ldapadd is add-only: on a re-run the entry already exists and this fails,
+  # so fall back to an explicit password replace to converge on the saved
+  # credential (same pattern as the Keycloak sysaccount above).
+  if ! \ldapadd -Y GSSAPI -H "ldap://${FREEIPA_FQDN}" -f "${INSTALL_LDIF_TMP}" 2>/dev/null; then
+    {
+      printf 'dn: uid=mail,cn=sysaccounts,cn=etc,%s\n' "${INSTALL_LDAP_BASE_DN}"
+      printf 'changetype: modify\n'
+      printf 'replace: userPassword\n'
+      printf 'userPassword: {CLEAR}%s\n' "${INSTALL_MAIL_LDAP_PASSWORD}"
+    } | \ldapmodify -Y GSSAPI -H "ldap://${FREEIPA_FQDN}" || true
+  fi
+
+  # Remove LDIF immediately — it contained a cleartext password
+  \rm -f "${INSTALL_LDIF_TMP}"
+  INSTALL_LDIF_TMP=""
+
+  # Service principals backing the shared Postfix/Dovecot TLS certificate
+  \ipa service-add "smtp/${FREEIPA_FQDN}" 2>/dev/null || true
+  \ipa service-add "imap/${FREEIPA_FQDN}" 2>/dev/null || true
+
+  \kdestroy 2>/dev/null || true
+
+  \mkdir -p /etc/mail/certs
+  INSTALL_MAIL_CERT_PATH="/etc/mail/certs/mail.pem"
+  INSTALL_MAIL_KEY_PATH="/etc/mail/certs/mail.key"
+
+  # Request (or reuse) a single IPA-issued certificate shared by Postfix and
+  # Dovecot — tracked and auto-renewed by certmonger. The request itself runs
+  # under the host's own credentials (no admin kinit needed for this part).
+  # -B/-C keep the key group-readable by postfix and reload both daemons
+  # across every certmonger-driven renewal, not just the initial issuance.
+  if ! \getcert list -f "${INSTALL_MAIL_CERT_PATH}" >/dev/null 2>&1; then
+    \ipa-getcert request \
+      -f "${INSTALL_MAIL_CERT_PATH}" \
+      -k "${INSTALL_MAIL_KEY_PATH}" \
+      -N "CN=${FREEIPA_FQDN}" \
+      -K "smtp/${FREEIPA_FQDN}" \
+      -D "${FREEIPA_FQDN}" \
+      -B "chown root:postfix ${INSTALL_MAIL_KEY_PATH}; chmod 640 ${INSTALL_MAIL_KEY_PATH}" \
+      -C "systemctl reload postfix dovecot 2>/dev/null || true" \
+      -w
+  fi
+
+  # Wait for certmonger to finish issuing the certificate (local CA — fast)
+  local elapsed=0
+  while [[ "${elapsed}" -lt 60 ]]; do
+    if \getcert list -f "${INSTALL_MAIL_CERT_PATH}" 2>/dev/null | \grep -q -- 'status: MONITORING'; then
+      break
+    fi
+    sleep 2
+    elapsed=$(( elapsed + 2 ))
+  done
+  if ! \getcert list -f "${INSTALL_MAIL_CERT_PATH}" 2>/dev/null | \grep -q -- 'status: MONITORING'; then
+    __error "Mail TLS certificate was not issued within 60 seconds (exit 70)"
+    exit 70
+  fi
+
+  \chown root:postfix "${INSTALL_MAIL_KEY_PATH}"
+  \chmod 640 "${INSTALL_MAIL_KEY_PATH}"
+
+  __log "FreeIPA configured for mail (Postfix/Dovecot) integration"
+}
+
+# - - - - - - - - - - - - - - - - - - - - - - - - -
+
+# ─── Mail storage (virtual mailboxes) ────────────────────────────────────────
+
+__create_mail_storage() {
+  __log "Preparing mail storage..."
+
+  if ! \getent group "${FREEIPA_MAIL_VUSER}" >/dev/null 2>&1; then
+    \groupadd -g "${FREEIPA_MAIL_VGID}" "${FREEIPA_MAIL_VUSER}"
+  fi
+  if ! \getent passwd "${FREEIPA_MAIL_VUSER}" >/dev/null 2>&1; then
+    \useradd -r -u "${FREEIPA_MAIL_VUID}" -g "${FREEIPA_MAIL_VGID}" \
+      -d "${FREEIPA_MAIL_BASE_DIR}" -s /usr/sbin/nologin "${FREEIPA_MAIL_VUSER}"
+  fi
+
+  \mkdir -p "${FREEIPA_MAIL_BASE_DIR}/${FREEIPA_MAIL_DOMAIN}"
+  \chown -R "${FREEIPA_MAIL_VUSER}:${FREEIPA_MAIL_VUSER}" "${FREEIPA_MAIL_BASE_DIR}"
+  \chmod -R 750 "${FREEIPA_MAIL_BASE_DIR}"
+
+  __log "Mail storage ready at ${FREEIPA_MAIL_BASE_DIR}/${FREEIPA_MAIL_DOMAIN}"
+}
+
+# - - - - - - - - - - - - - - - - - - - - - - - - -
+
+# ─── Postfix configuration ───────────────────────────────────────────────────
+
+__configure_postfix() {
+  __log "Configuring Postfix..."
+
+  \mkdir -p /etc/postfix/ldap
+
+  {
+    printf 'server_host = %s\n' "${FREEIPA_FQDN}"
+    printf 'server_port = 389\n'
+    printf 'start_tls = yes\n'
+    printf 'tls_ca_cert_file = /etc/ipa/ca.crt\n'
+    printf 'bind = yes\n'
+    printf 'bind_dn = uid=mail,cn=sysaccounts,cn=etc,%s\n' "${INSTALL_LDAP_BASE_DN}"
+    printf 'bind_pw = %s\n' "${INSTALL_MAIL_LDAP_PASSWORD}"
+    printf 'search_base = cn=users,cn=accounts,%s\n' "${INSTALL_LDAP_BASE_DN}"
+    printf 'scope = sub\n'
+    printf 'query_filter = (&(objectClass=posixAccount)(mail=%%s))\n'
+    printf 'result_attribute = uid\n'
+  } > /etc/postfix/ldap/virtual-mailbox.cf
+  \chown root:postfix /etc/postfix/ldap/virtual-mailbox.cf
+  \chmod 640 /etc/postfix/ldap/virtual-mailbox.cf
+
+  {
+    printf 'server_host = %s\n' "${FREEIPA_FQDN}"
+    printf 'server_port = 389\n'
+    printf 'start_tls = yes\n'
+    printf 'tls_ca_cert_file = /etc/ipa/ca.crt\n'
+    printf 'bind = yes\n'
+    printf 'bind_dn = uid=mail,cn=sysaccounts,cn=etc,%s\n' "${INSTALL_LDAP_BASE_DN}"
+    printf 'bind_pw = %s\n' "${INSTALL_MAIL_LDAP_PASSWORD}"
+    printf 'search_base = cn=users,cn=accounts,%s\n' "${INSTALL_LDAP_BASE_DN}"
+    printf 'scope = sub\n'
+    printf 'query_filter = (&(objectClass=posixAccount)(mail=%%s))\n'
+    printf 'result_attribute = mail\n'
+  } > /etc/postfix/ldap/virtual-alias.cf
+  \chown root:postfix /etc/postfix/ldap/virtual-alias.cf
+  \chmod 640 /etc/postfix/ldap/virtual-alias.cf
+
+  local marker_begin="# --- scriptmgr-freeipa mail block (begin) ---"
+  local marker_end="# --- scriptmgr-freeipa mail block (end) ---"
+
+  # Remove any previously-written block so re-runs converge instead of duplicating
+  \sed -i "/^${marker_begin}\$/,/^${marker_end}\$/d" /etc/postfix/main.cf
+
+  # Comment out distro-default keys our block redefines, so postconf -n has one value each
+  \sed -i -E \
+    -e 's/^(smtpd_tls_cert_file[[:space:]]*=.*)$/# \1 (superseded by scriptmgr-freeipa mail block)/' \
+    -e 's/^(smtpd_tls_key_file[[:space:]]*=.*)$/# \1 (superseded by scriptmgr-freeipa mail block)/' \
+    -e 's/^(inet_interfaces[[:space:]]*=.*)$/# \1 (superseded by scriptmgr-freeipa mail block)/' \
+    -e 's/^(mydestination[[:space:]]*=.*)$/# \1 (superseded by scriptmgr-freeipa mail block)/' \
+    /etc/postfix/main.cf
+
+  {
+    printf '%s\n' "${marker_begin}"
+    printf 'virtual_mailbox_domains = %s\n' "${FREEIPA_MAIL_DOMAIN}"
+    printf 'virtual_mailbox_base = %s\n' "${FREEIPA_MAIL_BASE_DIR}"
+    printf 'virtual_mailbox_maps = ldap:/etc/postfix/ldap/virtual-mailbox.cf\n'
+    printf 'virtual_alias_maps = ldap:/etc/postfix/ldap/virtual-alias.cf\n'
+    printf 'virtual_uid_maps = static:%s\n' "${FREEIPA_MAIL_VUID}"
+    printf 'virtual_gid_maps = static:%s\n' "${FREEIPA_MAIL_VGID}"
+    printf 'virtual_transport = lmtp:unix:private/dovecot-lmtp\n'
+    printf 'smtpd_sasl_type = dovecot\n'
+    printf 'smtpd_sasl_path = private/auth\n'
+    printf 'smtpd_sasl_auth_enable = yes\n'
+    printf 'smtpd_sasl_security_options = noanonymous\n'
+    printf 'smtpd_recipient_restrictions = permit_sasl_authenticated,permit_mynetworks,reject_unauth_destination\n'
+    printf 'smtpd_relay_restrictions = permit_sasl_authenticated,permit_mynetworks,reject_unauth_destination\n'
+    printf 'smtpd_tls_cert_file = %s\n' "${INSTALL_MAIL_CERT_PATH}"
+    printf 'smtpd_tls_key_file = %s\n' "${INSTALL_MAIL_KEY_PATH}"
+    printf 'smtpd_tls_CAfile = /etc/ipa/ca.crt\n'
+    printf 'smtpd_tls_security_level = may\n'
+    printf 'smtpd_tls_auth_only = yes\n'
+    printf 'smtp_tls_security_level = may\n'
+    printf 'myhostname = %s\n' "${FREEIPA_FQDN}"
+    printf 'mydomain = %s\n' "${FREEIPA_MAIL_DOMAIN}"
+    printf 'myorigin = $mydomain\n'
+    printf 'inet_interfaces = all\n'
+    printf 'mydestination = localhost\n'
+    printf '%s\n' "${marker_end}"
+  } >> /etc/postfix/main.cf
+
+  # Enable submission (587) and smtps (465) — idempotent, only append once
+  if ! \grep -q -- '^submission ' /etc/postfix/master.cf; then
+    {
+      printf 'submission inet n       -       n       -       -       smtpd\n'
+      printf '  -o syslog_name=postfix/submission\n'
+      printf '  -o smtpd_tls_security_level=encrypt\n'
+      printf '  -o smtpd_sasl_auth_enable=yes\n'
+      printf '  -o smtpd_relay_restrictions=permit_sasl_authenticated,reject\n'
+    } >> /etc/postfix/master.cf
+  fi
+  if ! \grep -q -- '^smtps ' /etc/postfix/master.cf; then
+    {
+      printf 'smtps     inet  n       -       n       -       -       smtpd\n'
+      printf '  -o syslog_name=postfix/smtps\n'
+      printf '  -o smtpd_tls_wrappermode=yes\n'
+      printf '  -o smtpd_sasl_auth_enable=yes\n'
+      printf '  -o smtpd_relay_restrictions=permit_sasl_authenticated,reject\n'
+    } >> /etc/postfix/master.cf
+  fi
+
+  \systemctl enable postfix
+  \systemctl restart postfix
+
+  __log "Postfix configured"
+}
+
+# - - - - - - - - - - - - - - - - - - - - - - - - -
+
+# ─── Dovecot configuration ───────────────────────────────────────────────────
+
+__configure_dovecot() {
+  __log "Configuring Dovecot..."
+
+  # Disable the distro-default system passdb/userdb include so FreeIPA LDAP
+  # is the only credential source — safe to re-run, matches only when active
+  if [[ -f /etc/dovecot/conf.d/10-auth.conf ]]; then
+    \sed -i 's/^!include auth-system.conf.ext/#!include auth-system.conf.ext/' \
+      /etc/dovecot/conf.d/10-auth.conf
+  fi
+
+  {
+    printf 'hosts = %s\n' "${FREEIPA_FQDN}"
+    printf 'tls = yes\n'
+    printf 'tls_ca_cert_file = /etc/ipa/ca.crt\n'
+    printf 'dn = uid=mail,cn=sysaccounts,cn=etc,%s\n' "${INSTALL_LDAP_BASE_DN}"
+    printf 'dnpass = %s\n' "${INSTALL_MAIL_LDAP_PASSWORD}"
+    # Validate the user's own password via a bind as their own DN — FreeIPA
+    # locks down userPassword reads, so this is the supported check method
+    printf 'auth_bind = yes\n'
+    printf 'auth_bind_userdn = uid=%%n,cn=users,cn=accounts,%s\n' "${INSTALL_LDAP_BASE_DN}"
+    printf 'ldap_version = 3\n'
+    printf 'base = cn=users,cn=accounts,%s\n' "${INSTALL_LDAP_BASE_DN}"
+    printf 'scope = subtree\n'
+    printf 'user_filter = (&(objectClass=posixAccount)(uid=%%n))\n'
+    printf 'pass_filter = (&(objectClass=posixAccount)(uid=%%n))\n'
+    printf 'user_attrs = =home=%s/%s/%%n,=uid=%s,=gid=%s\n' \
+      "${FREEIPA_MAIL_BASE_DIR}" "${FREEIPA_MAIL_DOMAIN}" "${FREEIPA_MAIL_VUID}" "${FREEIPA_MAIL_VGID}"
+  } > /etc/dovecot/dovecot-ldap.conf.ext
+  \chown root:dovecot /etc/dovecot/dovecot-ldap.conf.ext
+  \chmod 640 /etc/dovecot/dovecot-ldap.conf.ext
+
+  local marker_begin="# --- scriptmgr-freeipa mail block (begin) ---"
+  local marker_end="# --- scriptmgr-freeipa mail block (end) ---"
+
+  \sed -i "/^${marker_begin}\$/,/^${marker_end}\$/d" /etc/dovecot/dovecot.conf
+
+  {
+    printf '%s\n' "${marker_begin}"
+    printf 'mail_location = maildir:%s/%%d/%%n\n' "${FREEIPA_MAIL_BASE_DIR}"
+    printf 'disable_plaintext_auth = yes\n'
+    printf 'auth_mechanisms = plain login\n'
+    printf 'passdb {\n  driver = ldap\n  args = /etc/dovecot/dovecot-ldap.conf.ext\n}\n'
+    printf 'userdb {\n  driver = ldap\n  args = /etc/dovecot/dovecot-ldap.conf.ext\n}\n'
+    printf 'ssl = required\n'
+    printf 'ssl_cert = <%s\n' "${INSTALL_MAIL_CERT_PATH}"
+    printf 'ssl_key = <%s\n' "${INSTALL_MAIL_KEY_PATH}"
+    printf 'protocols = imap pop3 lmtp\n'
+    printf 'service lmtp {\n  unix_listener /var/spool/postfix/private/dovecot-lmtp {\n    mode = 0600\n    user = postfix\n    group = postfix\n  }\n}\n'
+    printf 'service auth {\n  unix_listener /var/spool/postfix/private/auth {\n    mode = 0666\n    user = postfix\n    group = postfix\n  }\n}\n'
+    printf '%s\n' "${marker_end}"
+  } >> /etc/dovecot/dovecot.conf
+
+  \systemctl enable dovecot
+  \systemctl restart dovecot
+
+  __log "Dovecot configured"
+}
+
+# - - - - - - - - - - - - - - - - - - - - - - - - -
+
 # ─── Summary ─────────────────────────────────────────────────────────────────
 
 __display_summary() {
@@ -1654,6 +2000,16 @@ __display_summary() {
   printf '  Kerberos SPNEGO: HTTP/%s@%s\n' "${FREEIPA_FQDN}" "${FREEIPA_REALM}"
   printf '  Docker compose: %s/docker-compose.yml\n' "${FREEIPA_COMPOSE_DIR}"
   printf '  Credentials:    %s\n' "${FREEIPA_CRED_FILE}"
+
+  printf '\nMail (Postfix/Dovecot):\n'
+  printf '  Domain:           %s\n' "${FREEIPA_MAIL_DOMAIN}"
+  printf '  SMTP (STARTTLS):  %s:587\n' "${FREEIPA_FQDN}"
+  printf '  SMTPS:            %s:465\n' "${FREEIPA_FQDN}"
+  printf '  IMAP (TLS):       %s:993\n' "${FREEIPA_FQDN}"
+  printf '  POP3 (TLS):       %s:995\n' "${FREEIPA_FQDN}"
+  printf '  Auth:             FreeIPA LDAP bind — any posixAccount user with a mail attribute\n'
+  printf '  Mailbox storage:  %s/%s/<uid>\n' "${FREEIPA_MAIL_BASE_DIR}" "${FREEIPA_MAIL_DOMAIN}"
+  printf '  TLS certificate:  FreeIPA-issued, tracked by certmonger (auto-renews)\n'
 }
 
 # - - - - - - - - - - - - - - - - - - - - - - - - -
@@ -1753,6 +2109,11 @@ __main() {
   __configure_keycloak_nginx
   __configure_ad_trust
   __create_initial_objects
+  __install_mail_packages
+  __setup_freeipa_for_mail
+  __create_mail_storage
+  __configure_postfix
+  __configure_dovecot
   __display_summary
 
   __log "FreeIPA + Keycloak installation and configuration completed"
