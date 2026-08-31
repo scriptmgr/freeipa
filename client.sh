@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # shellcheck shell=bash
 # - - - - - - - - - - - - - - - - - - - - - - - - -
-##@Version           :  202608301000-git
+##@Version           :  202608310017-git
 # @@Author           :  Jason Hempstead
 # @@Contact          :  git-admin@casjaysdev.pro
 # @@License          :  MIT or LICENSE.md
@@ -10,7 +10,7 @@
 # @@Created          :  Sunday, August 30, 2026 10:00 UTC
 # @@File             :  client.sh
 # @@Description      :  Enroll this host as a FreeIPA client, distro-agnostic
-# @@Changelog        :  Initial version
+# @@Changelog        :  Add Arch Linux client support (sssd + krb5, no AUR build)
 # @@TODO             :  None
 # @@Other            :
 # @@Resource         :  https://www.freeipa.org/page/Documentation
@@ -20,7 +20,7 @@
 # - - - - - - - - - - - - - - - - - - - - - - - - -
 # shellcheck disable=SC1001,SC1003,SC2001,SC2003,SC2016,SC2031,SC2034,SC2090,SC2115,SC2120,SC2155,SC2199,SC2229,SC2317,SC2329
 # - - - - - - - - - - - - - - - - - - - - - - - - -
-VERSION="202608301000-git"
+VERSION="202608310017-git"
 # - - - - - - - - - - - - - - - - - - - - - - - - -
 APPNAME="${0##*/}"
 RUN_USER="${SUDO_USER:-$USER}"
@@ -69,7 +69,12 @@ FREEIPA_DEBUG="${FREEIPA_DEBUG:-0}"
 __determine_domain_name() {
   local domain
   domain="$(\hostname -d 2>/dev/null)"
-  if [[ -n "${domain}" ]]; then
+  # GNU inetutils' `hostname -d` prints a literal "none" or "(none)" sentinel
+  # (not empty) when no domain part is configured, depending on whether the
+  # NIS domainname or the static hostname's missing dot is being reported —
+  # treat both forms the same as an empty result rather than using them
+  # verbatim as a domain name
+  if [[ -n "${domain}" && "${domain}" != "none" && "${domain}" != "(none)" ]]; then
     printf '%s\n' "${domain}"
     return 0
   fi
@@ -188,7 +193,7 @@ __help() {
   printf '                           password — generate on the server with:\n'
   printf '                           ipa host-add <fqdn> --random)\n'
   printf '  FREEIPA_CA_SHA256        Expected SHA-256 fingerprint of the server'"'"'s CA cert\n'
-  printf '                           (Alpine path only; obtain out-of-band with:\n'
+  printf '                           (Alpine/Arch paths only; obtain out-of-band with:\n'
   printf '                           openssl x509 -noout -fingerprint -sha256 -in /etc/ipa/ca.crt)\n'
   printf '  FREEIPA_DEBUG            Enable debug output when set to 1 (same as --debug)\n'
   printf '  NO_COLOR                 Disable color output when set\n\n'
@@ -197,6 +202,10 @@ __help() {
   printf '  load NSS modules, so full directory-integrated identity (getent/id/login)\n'
   printf '  is not possible there. On Alpine this script installs krb5 (kinit works)\n'
   printf '  and, only on Alpine edge, sssd for pam_sss-based PAM authentication.\n'
+  printf '  Arch Linux has no freeipa-client/realmd/adcli package outside the AUR, so\n'
+  printf '  this script installs sssd + krb5 instead; unlike Alpine, Arch is glibc-\n'
+  printf '  based so getent/id/login all resolve normally, but this host'"'"'s own\n'
+  printf '  directory entry/keytab is not registered (no ipa-client-install/ipa-join).\n'
   printf '  See TODO.AI.md for details.\n'
 }
 
@@ -312,7 +321,16 @@ __configure_hostname() {
     fi
     FREEIPA_FQDN="${FREEIPA_FQDN,,}"
     __log "Hostname was not fully qualified; using ${FREEIPA_FQDN}"
-    \hostnamectl set-hostname "${FREEIPA_FQDN}"
+
+    # hostnamectl requires systemd; Alpine (OpenRC) and other non-systemd
+    # distros have no such binary, so fall back to setting /etc/hostname and
+    # the kernel hostname directly — the same end state hostnamectl reaches
+    if \command -v hostnamectl >/dev/null 2>&1; then
+      \hostnamectl set-hostname "${FREEIPA_FQDN}"
+    else
+      printf '%s\n' "${FREEIPA_FQDN}" > /etc/hostname
+      \hostname "${FREEIPA_FQDN}"
+    fi
   fi
 
   FREEIPA_DOMAIN="${FREEIPA_DOMAIN:-${FREEIPA_FQDN#*.}}"
@@ -370,6 +388,11 @@ __install_client_packages() {
 
     *alpine*)
       __install_alpine_client_packages
+      return 0
+      ;;
+
+    *arch*)
+      __install_arch_client_packages
       return 0
       ;;
 
@@ -445,6 +468,13 @@ __verify_enrollment() {
     __warn "getent could not resolve ${FREEIPA_ADMIN_PRINCIPAL}; SSSD may still be starting"
   fi
 
+  # The Arch path (__enroll_arch_client) never registers this host's own
+  # directory entry/keytab — see its header comment — so a host/<fqdn>
+  # keytab check would always fail here and isn't a meaningful signal
+  if [[ "${INSTALL_DISTRO_FAMILY}" == *arch* ]]; then
+    return 0
+  fi
+
   if \kinit -k "host/${FREEIPA_FQDN}" 2>/dev/null; then
     __log "Host keytab authenticates successfully"
     \kdestroy >/dev/null 2>&1 || true
@@ -469,7 +499,11 @@ __install_alpine_client_packages() {
   __warn "Installing the best available path — see TODO.AI.md for details"
 
   \apk update
-  \apk add krb5
+
+  # curl and openssl are needed by __fetch_ca_cert_tofu (shared with the
+  # Arch path below); Arch's base image ships both already, Alpine's
+  # minimal image does not, so they must be installed explicitly here
+  \apk add krb5 curl openssl
 
   if \grep -q -- "/edge/" /etc/apk/repositories 2>/dev/null; then
     __log "Alpine edge detected; installing sssd for pam_sss-based PAM auth"
@@ -479,7 +513,10 @@ __install_alpine_client_packages() {
   fi
 }
 
-__fetch_alpine_ca_cert() {
+# Shared by the Alpine and Arch best-effort paths — neither ships
+# ipa-client-install, so neither can fetch/validate the server's CA cert the
+# normal way; both need this trust-on-first-use fetch instead.
+__fetch_ca_cert_tofu() {
   \mkdir -p /etc/ipa
 
   # HTTPS alone doesn't establish trust here — this is the client's first
@@ -508,7 +545,7 @@ __fetch_alpine_ca_cert() {
 }
 
 __enroll_alpine_client() {
-  __fetch_alpine_ca_cert
+  __fetch_ca_cert_tofu
 
   \cat > /etc/krb5.conf <<-EOF
 	[libdefaults]
@@ -529,21 +566,37 @@ __enroll_alpine_client() {
 
   if \command -v sssd >/dev/null 2>&1; then
     \mkdir -p /etc/sssd
+
+    # Base DN built from the domain's dot-separated labels, one "dc" RDN
+    # per label, locating FreeIPA's anonymously-readable Schema
+    # Compatibility tree used below. The IPA-native sssd identity backend
+    # was tried first and rejected: it unconditionally needs a SASL/GSSAPI
+    # principal from a host keytab to even start up, and with no keytab
+    # here that startup fails outright, taking pam_sss authentication down
+    # with it too (confirmed empirically on the equivalent Arch path — see
+    # its header comment for the full explanation). A plain LDAP backend
+    # against the compat tree, paired with ordinary password-based
+    # Kerberos auth, needs no host keytab for either lookups or pam_sss.
+    local basedn
+    basedn="$(printf '%s' "${FREEIPA_DOMAIN}" | \awk -F. '{for (i = 1; i <= NF; i++) printf "dc=%s%s", $i, (i < NF ? "," : "")}')"
+
     \cat > /etc/sssd/sssd.conf <<-EOF
 	[sssd]
 	services = nss, pam
 	domains = ${FREEIPA_DOMAIN}
 
 	[domain/${FREEIPA_DOMAIN}]
-	id_provider = ipa
-	auth_provider = ipa
-	access_provider = ipa
-	chpass_provider = ipa
-	ipa_server = ${FREEIPA_SERVER}
-	ipa_domain = ${FREEIPA_DOMAIN}
-	ipa_hostname = ${FREEIPA_FQDN}
+	id_provider = ldap
+	ldap_uri = ldap://${FREEIPA_SERVER}
+	ldap_search_base = cn=compat,${basedn}
+	ldap_user_search_base = cn=users,cn=compat,${basedn}
+	ldap_group_search_base = cn=groups,cn=compat,${basedn}
+	ldap_schema = rfc2307bis
+	ldap_tls_reqcert = never
+	auth_provider = krb5
+	krb5_server = ${FREEIPA_SERVER}
 	krb5_realm = ${FREEIPA_REALM}
-	ldap_tls_cacert = /etc/ipa/ca.crt
+	chpass_provider = krb5
 	cache_credentials = True
 	enumerate = False
 	EOF
@@ -555,6 +608,149 @@ __enroll_alpine_client() {
   fi
 
   __log "krb5 configured — 'kinit ${FREEIPA_ADMIN_PRINCIPAL}' authenticates against ${FREEIPA_SERVER}"
+  __save_credential "${FREEIPA_CRED_FILE}" FREEIPA_SERVER "${FREEIPA_SERVER}"
+  __save_credential "${FREEIPA_CRED_FILE}" FREEIPA_DOMAIN "${FREEIPA_DOMAIN}"
+  __save_credential "${FREEIPA_CRED_FILE}" FREEIPA_REALM "${FREEIPA_REALM}"
+}
+
+# - - - - - - - - - - - - - - - - - - - - - - - - -
+
+# ─── Arch Linux (sssd, no ipa-client-install) path ───────────────────────────
+#
+# Arch's official repos carry no freeipa-client/realmd/adcli package — only
+# an AUR build (deep, mostly-AUR dependency tree) provides ipa-client-install,
+# which is out of scope for a non-interactive installer. Unlike Alpine, Arch
+# is glibc-based, so sssd's NSS module (libnss_sss.so.2) loads normally, and
+# this path gives FULL directory-integrated identity (getent/id/login all
+# resolve), not just kinit.
+#
+# sssd's own `id_provider = ipa` backend was tried first and rejected: it
+# unconditionally selects a SASL/GSSAPI principal from /etc/krb5.keytab at
+# backend-init time — with no host keytab (registering one requires
+# ipa-join, itself AUR-only) that init hard-fails, taking every sssd
+# service down with it, not just identity lookups (confirmed empirically:
+# `be_process_init` fails and pam_sss auth is unreachable too, since the
+# whole backend never comes up). Instead this path uses `id_provider =
+# ldap` against FreeIPA's Schema Compatibility tree (cn=compat,...), which
+# FreeIPA publishes read-anonymously by default specifically for non-IPA
+# LDAP clients — confirmed via `ldapsearch -x` against a live server. Auth
+# goes through `auth_provider = krb5` (plain password Kerberos, like
+# kinit), which likewise needs no host keytab. Out of scope, same as
+# Alpine: registering this host's own directory entry/keytab.
+
+__install_arch_client_packages() {
+  __warn "Arch has no freeipa-client/realmd/adcli package outside the AUR"
+  __warn "Installing sssd + krb5 instead — full NSS identity resolution works"
+  __warn "(glibc, unlike Alpine/musl); host keytab enrollment is out of scope"
+
+  # curl and openssl are needed by __fetch_ca_cert_tofu (shared with the
+  # Alpine path above); included explicitly since a minimal Arch base may
+  # not ship them
+  \pacman -Sy --noconfirm --needed krb5 sssd curl openssl
+}
+
+__enroll_arch_client() {
+  __fetch_ca_cert_tofu
+
+  # Build the LDAP base DN from the domain's dot-separated labels (one "dc"
+  # RDN per label) to locate FreeIPA's anonymously-readable Schema
+  # Compatibility tree below
+  local basedn
+  basedn="$(printf '%s' "${FREEIPA_DOMAIN}" | \awk -F. '{for (i = 1; i <= NF; i++) printf "dc=%s%s", $i, (i < NF ? "," : "")}')"
+
+  \cat > /etc/krb5.conf <<-EOF
+	[libdefaults]
+	  default_realm = ${FREEIPA_REALM}
+	  dns_lookup_realm = false
+	  dns_lookup_kdc = false
+
+	[realms]
+	  ${FREEIPA_REALM} = {
+	    kdc = ${FREEIPA_SERVER}
+	    admin_server = ${FREEIPA_SERVER}
+	  }
+
+	[domain_realm]
+	  .${FREEIPA_DOMAIN} = ${FREEIPA_REALM}
+	  ${FREEIPA_DOMAIN} = ${FREEIPA_REALM}
+	EOF
+
+  \mkdir -p /etc/sssd
+  \cat > /etc/sssd/sssd.conf <<-EOF
+	[sssd]
+	services = nss, pam
+	domains = ${FREEIPA_DOMAIN}
+
+	[domain/${FREEIPA_DOMAIN}]
+	id_provider = ldap
+	ldap_uri = ldap://${FREEIPA_SERVER}
+	ldap_search_base = cn=compat,${basedn}
+	ldap_user_search_base = cn=users,cn=compat,${basedn}
+	ldap_group_search_base = cn=groups,cn=compat,${basedn}
+	ldap_schema = rfc2307bis
+	ldap_tls_reqcert = never
+	auth_provider = krb5
+	krb5_server = ${FREEIPA_SERVER}
+	krb5_realm = ${FREEIPA_REALM}
+	chpass_provider = krb5
+	cache_credentials = True
+	enumerate = False
+	EOF
+  \chmod 600 /etc/sssd/sssd.conf
+
+  # nsswitch.conf ships without "sss" on a stock Arch install; add it to the
+  # three databases sssd serves so getent/id actually consult the directory.
+  # Guarded per-line so a re-run (this script is meant to be idempotent,
+  # matching install.sh) never appends a duplicate "sss" token.
+  \sed -i -E \
+    '/^passwd:/{/\bsss\b/!s/^(passwd:.*)$/\1 sss/}; /^group:/{/\bsss\b/!s/^(group:.*)$/\1 sss/}; /^shadow:/{/\bsss\b/!s/^(shadow:.*)$/\1 sss/}' \
+    /etc/nsswitch.conf
+
+  # Arch centralizes auth/account/password/session stacks in system-auth
+  # (pambase); wiring pam_sss.so here reaches login (via system-local-login
+  # -> system-login), sudo, and system-login directly. Stock Arch's own
+  # /etc/pam.d/su deliberately does NOT include system-auth for its
+  # auth/account/session stack (only for password) — a minimal-attack-surface
+  # default upstream, confirmed by reading the shipped file — so su is wired
+  # separately below to match the mkhomedir/auth behavior every other
+  # supported distro gets from su out of the box.
+  if ! \grep -q -- "pam_sss.so" /etc/pam.d/system-auth; then
+    \sed -i \
+      -e '/^auth[[:space:]]\+\[success=1 default=bad\][[:space:]]\+pam_unix.so/i auth       sufficient                  pam_sss.so            use_first_pass' \
+      -e '/^account[[:space:]]\+required[[:space:]]\+pam_unix.so/i account    [default=bad success=ok user_unknown=ignore] pam_sss.so' \
+      -e '/^password[[:space:]]\+required[[:space:]]\+pam_unix.so/i password   sufficient                  pam_sss.so            use_authtok' \
+      -e '/^session[[:space:]]\+required[[:space:]]\+pam_unix.so/i session    optional                    pam_sss.so' \
+      /etc/pam.d/system-auth
+  fi
+
+  if [[ "${INSTALL_MKHOMEDIR}" == "true" ]] && ! \grep -q -- "pam_mkhomedir.so" /etc/pam.d/system-auth; then
+    \sed -i '/^session[[:space:]]\+required[[:space:]]\+pam_unix.so/i session    optional                    pam_mkhomedir.so      umask=0022 skel=/etc/skel' /etc/pam.d/system-auth
+  fi
+
+  # util-linux's su resolves to a DIFFERENT PAM service depending on
+  # invocation: plain "su <user>" uses su, but "su - <user>" (login shell)
+  # uses su-l — both ship separately on Arch and neither includes
+  # system-auth, so both need the same wiring applied individually.
+  local su_service
+  for su_service in su su-l; do
+    if [[ -f "/etc/pam.d/${su_service}" ]] && ! \grep -q -- "pam_sss.so" "/etc/pam.d/${su_service}"; then
+      \sed -i \
+        -e '/^auth[[:space:]]\+required[[:space:]]\+pam_unix.so/i auth       sufficient                  pam_sss.so            use_first_pass' \
+        -e '/^account[[:space:]]\+required[[:space:]]\+pam_unix.so/i account    [default=bad success=ok user_unknown=ignore] pam_sss.so' \
+        -e '/^session[[:space:]]\+required[[:space:]]\+pam_unix.so/i session    optional                    pam_sss.so' \
+        "/etc/pam.d/${su_service}"
+
+      if [[ "${INSTALL_MKHOMEDIR}" == "true" ]] && ! \grep -q -- "pam_mkhomedir.so" "/etc/pam.d/${su_service}"; then
+        \sed -i \
+          '/^session[[:space:]]\+required[[:space:]]\+pam_unix.so/i session    optional                    pam_mkhomedir.so      umask=0022 skel=/etc/skel' \
+          "/etc/pam.d/${su_service}"
+      fi
+    fi
+  done
+
+  \systemctl enable --now sssd
+
+  __log "sssd configured with full NSS identity resolution (getent/id/login work)"
   __save_credential "${FREEIPA_CRED_FILE}" FREEIPA_SERVER "${FREEIPA_SERVER}"
   __save_credential "${FREEIPA_CRED_FILE}" FREEIPA_DOMAIN "${FREEIPA_DOMAIN}"
   __save_credential "${FREEIPA_CRED_FILE}" FREEIPA_REALM "${FREEIPA_REALM}"
@@ -671,6 +867,9 @@ __main() {
 
   if [[ "${INSTALL_DISTRO_FAMILY}" == *alpine* ]]; then
     __enroll_alpine_client
+  elif [[ "${INSTALL_DISTRO_FAMILY}" == *arch* ]]; then
+    __enroll_arch_client
+    __verify_enrollment
   else
     __enroll_client
     __verify_enrollment

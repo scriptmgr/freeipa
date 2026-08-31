@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # shellcheck shell=bash
 # - - - - - - - - - - - - - - - - - - - - - - - - -
-##@Version           :  202605221532-git
+##@Version           :  202608310342-git
 # @@Author           :  Jason Hempstead
 # @@Contact          :  git-admin@casjaysdev.pro
 # @@License          :  MIT or LICENSE.md
@@ -10,7 +10,7 @@
 # @@Created          :  Thursday, May 22, 2026 14:29 UTC
 # @@File             :  install.sh
 # @@Description      :  Full FreeIPA + Keycloak SSO bootstrap script, distro-agnostic
-# @@Changelog        :  Add Keycloak SSO phases 3-6
+# @@Changelog        :  Reverse-proxy Keycloak under /kc via Apache mod_rewrite
 # @@TODO             :  None
 # @@Other            :
 # @@Resource         :  https://www.freeipa.org/page/Documentation
@@ -20,7 +20,7 @@
 # - - - - - - - - - - - - - - - - - - - - - - - - -
 # shellcheck disable=SC1001,SC1003,SC2001,SC2003,SC2016,SC2031,SC2034,SC2090,SC2115,SC2120,SC2155,SC2199,SC2229,SC2317,SC2329
 # - - - - - - - - - - - - - - - - - - - - - - - - -
-VERSION="202605221532-git"
+VERSION="202608310342-git"
 # - - - - - - - - - - - - - - - - - - - - - - - - -
 APPNAME="${0##*/}"
 RUN_USER="${SUDO_USER:-$USER}"
@@ -343,7 +343,7 @@ __check_requirements() {
   __log "Checking system requirements..."
 
   local mem_kb mem_gb disk_avail disk_gb
-  mem_kb="$(\grep -- "MemTotal" /proc/meminfo | \awk '{print $2}' || true)"
+  mem_kb="$(\awk '/MemTotal/{print $2}' /proc/meminfo || true)"
   mem_gb=$(( mem_kb / 1024 / 1024 ))
 
   if [[ "${mem_gb}" -lt 2 ]]; then
@@ -658,7 +658,7 @@ __configure_dns_settings() {
     local _ns _ipv4_fwds=""
     while IFS= read -r _ns; do
       _ipv4_fwds="${_ipv4_fwds:+${_ipv4_fwds} }${_ns}"
-    done < <(\grep -E -- '^nameserver[[:space:]]+[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' /etc/resolv.conf | \awk '{print $2}')
+    done < <(\awk '/^nameserver[[:space:]]+[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/{print $2}' /etc/resolv.conf)
     if [[ -n "${_ipv4_fwds}" ]]; then
       __log "Using IPv4 DNS forwarders: ${_ipv4_fwds}"
       INSTALL_DNS_FORWARDERS="${_ipv4_fwds}"
@@ -1019,6 +1019,84 @@ EOF
 
 # - - - - - - - - - - - - - - - - - - - - - - - - -
 
+# ─── Keycloak Apache reverse proxy ───────────────────────────────────────────
+#
+# Keycloak is deliberately left at its own default root path (no
+# KC_HTTP_RELATIVE_PATH) — that keeps direct access via FREEIPA_KEYCLOAK_PORT
+# working at "/" with no prefix, for anyone who wants to reach it without
+# going through Apache. mod_rewrite's [P] flag proxies "/kc/*" to Keycloak
+# with the prefix stripped, so Keycloak itself never knows it's under a
+# prefix. Because Keycloak's HTML/JS then generates absolute links like
+# "/realms/...", "/resources/...", "/js/..." (unaware of "/kc"), those exact
+# top-level paths are proxied through too, unprefixed, so the browser's
+# follow-up requests still land on Keycloak rather than 404 against
+# FreeIPA's own vhost. This path list matches the Keycloak version pinned in
+# __install_keycloak_docker's docker-compose.yml and may need updating on a
+# major Keycloak upgrade.
+__configure_apache_keycloak_proxy() {
+  local apache_conf_dir="" ssl_conf=""
+  if [[ -d "/etc/httpd/conf.d" ]]; then
+    apache_conf_dir="/etc/httpd/conf.d"
+    ssl_conf="/etc/httpd/conf.d/ssl.conf"
+  elif [[ -d "/etc/apache2/conf-available" ]]; then
+    apache_conf_dir="/etc/apache2/conf-available"
+    ssl_conf="/etc/apache2/conf-available/ssl.conf"
+  else
+    __warn "Could not find Apache configuration directory; skipping Keycloak proxy config"
+    return 0
+  fi
+
+  # Keycloak's docker-compose publishes on the docker0 bridge address, not
+  # 127.0.0.1 — see the "172.17.0.1:${FREEIPA_KEYCLOAK_PORT}" host-port
+  # binding in __install_keycloak_docker's compose file. Proxying to
+  # 127.0.0.1 here would connect-refuse.
+  local kc_conf="${apache_conf_dir}/freeipa-keycloak-proxy.conf"
+  \cat > "${kc_conf}" << EOF
+# Keycloak reverse proxy under /kc — managed by install.sh
+<IfModule mod_proxy.c>
+  ProxyPreserveHost On
+  ProxyPassReverse /kc/ http://172.17.0.1:${FREEIPA_KEYCLOAK_PORT}/
+</IfModule>
+
+<IfModule mod_rewrite.c>
+  RewriteEngine On
+  RewriteRule ^/kc\$ /kc/ [R=301,L]
+  RewriteRule ^/kc/(.*)\$ http://172.17.0.1:${FREEIPA_KEYCLOAK_PORT}/\$1 [P,L]
+  RewriteRule ^/(admin|realms|resources|js|welcome-content|robots\.txt)(.*)\$ http://172.17.0.1:${FREEIPA_KEYCLOAK_PORT}/\$1\$2 [P,L]
+</IfModule>
+
+RequestHeader set X-Forwarded-Proto "https"
+RequestHeader set X-Forwarded-Port "${FREEIPA_PORT}"
+EOF
+
+  if [[ -d "/etc/apache2/conf-enabled" ]]; then
+    \ln -sf "${kc_conf}" /etc/apache2/conf-enabled/freeipa-keycloak-proxy.conf
+  fi
+
+  # A plain conf.d/*.conf file is loaded at Apache's global/server scope,
+  # not inside the <VirtualHost _default_:443 _default_:${FREEIPA_PORT}>
+  # block that actually handles FREEIPA_PORT requests, so its RewriteRule/
+  # ProxyPass directives would never be evaluated. ipa-rewrite.conf avoids
+  # this by being Include'd from inside that VirtualHost (see ssl.conf) —
+  # mirror that exact pattern here, idempotently.
+  if [[ -f "${ssl_conf}" ]] && ! \grep -q -- "Include ${kc_conf}" "${ssl_conf}" 2>/dev/null; then
+    \sed -i "/^Include .*ipa-rewrite\.conf\$/a Include ${kc_conf}" "${ssl_conf}" 2>/dev/null || true
+    __log "Included freeipa-keycloak-proxy.conf inside the SSL VirtualHost"
+  fi
+
+  local _web_units
+  _web_units="$(\systemctl list-unit-files 2>/dev/null | \awk '{print $1}' || true)"
+  if printf '%s\n' "${_web_units}" | \grep -q -- "^httpd.service$"; then
+    \systemctl restart httpd
+  elif printf '%s\n' "${_web_units}" | \grep -q -- "^apache2.service$"; then
+    \systemctl restart apache2
+  fi
+
+  __log "Configured Apache to reverse-proxy Keycloak under /kc on port ${FREEIPA_PORT}"
+}
+
+# - - - - - - - - - - - - - - - - - - - - - - - - -
+
 # ─── LDAP base DN derivation ─────────────────────────────────────────────────
 
 __derive_ldap_base_dn() {
@@ -1309,10 +1387,23 @@ services:
       KC_HTTP_ENABLED: "true"
       KC_HTTP_PORT: "${FREEIPA_KEYCLOAK_PORT}"
       KC_HOSTNAME_STRICT: "false"
-      KC_PROXY: edge
+      # KC_PROXY: edge is the deprecated Hostname v1 proxy option (Keycloak
+      # logs "Hostname v1 options [proxy] are still in use" and still emits
+      # http:// links behind TLS termination). KC_PROXY_HEADERS: xforwarded
+      # is its Hostname v2 replacement — it makes Keycloak trust the
+      # X-Forwarded-Proto/Port/For headers Apache sets, so redirect and
+      # asset URLs come back with the correct https scheme and port when
+      # reached through the /kc reverse proxy.
+      KC_PROXY_HEADERS: xforwarded
       KC_TRUSTSTORE_PATHS: /etc/keycloak/ipa-ca.crt
-      KEYCLOAK_ADMIN: admin
-      KEYCLOAK_ADMIN_PASSWORD: "${INSTALL_KEYCLOAK_ADMIN_PASSWORD}"
+      # The deprecated KEYCLOAK_ADMIN/KEYCLOAK_ADMIN_PASSWORD pair creates a
+      # "temporary" admin that Keycloak forces through a password-change
+      # flow in its web UI before any API password grant will succeed —
+      # every scripted token request below fails with invalid_user_credentials
+      # until that UI step runs. KC_BOOTSTRAP_ADMIN_USERNAME/PASSWORD creates
+      # a normal, immediately usable admin instead.
+      KC_BOOTSTRAP_ADMIN_USERNAME: admin
+      KC_BOOTSTRAP_ADMIN_PASSWORD: "${INSTALL_KEYCLOAK_ADMIN_PASSWORD}"
       KC_LOG_LEVEL: INFO
       JAVA_OPTS_APPEND: -Djava.security.krb5.conf=/etc/krb5.conf
     volumes:
@@ -1528,7 +1619,7 @@ __configure_keycloak() {
       -H "Authorization: Bearer ${token}" \
       -H "Content-Type: application/json" \
       -d "${ldap_body}")"
-    component_id="$(printf '%s\n' "${ldap_response}" | \grep -i -- "^[Ll]ocation:" | \sed 's|.*/||' | \tr -d '\r\n')"
+    component_id="$(\grep -i -- "^[Ll]ocation:" <<< "${ldap_response}" | \sed 's|.*/||' | \tr -d '\r\n')"
     __log "LDAP federation component created (id: ${component_id})"
   fi
 
@@ -1691,8 +1782,8 @@ server {
     listen 443 ssl;
     server_name ${FREEIPA_FQDN};
 
-    ssl_certificate     /etc/letsencrypt/live/domain/fullchain.pem;
-    ssl_certificate_key /etc/letsencrypt/live/domain/privkey.pem;
+    ssl_certificate     ${INSTALL_FULLCHAIN_PATH};
+    ssl_certificate_key ${INSTALL_KEY_PATH};
     ssl_protocols       TLSv1.2 TLSv1.3;
     ssl_ciphers         HIGH:!aNULL:!MD5;
 
@@ -2263,7 +2354,8 @@ __display_summary() {
   printf '  %s        — generated credentials\n' "${FREEIPA_CRED_FILE}"
 
   printf '\nKeycloak SSO:\n'
-  printf '  Admin console:  http://172.17.0.1:%s (internal)\n' "${FREEIPA_KEYCLOAK_PORT}"
+  printf '  Via Apache:     https://%s:%s/kc\n' "${FREEIPA_FQDN}" "${FREEIPA_PORT}"
+  printf '  Direct (internal): http://172.17.0.1:%s\n' "${FREEIPA_KEYCLOAK_PORT}"
   printf '  Admin user:     admin (Keycloak master realm)\n'
   printf '  Admin pass:     (saved to %s)\n' "${FREEIPA_CRED_FILE}"
   printf '  Realm:          %s\n' "${FREEIPA_KEYCLOAK_REALM}"
@@ -2388,6 +2480,7 @@ __main() {
   __install_keycloak_docker
   __wait_for_keycloak
   __configure_keycloak
+  __configure_apache_keycloak_proxy
   __configure_keycloak_nginx
   __configure_ad_trust
   __create_initial_objects
