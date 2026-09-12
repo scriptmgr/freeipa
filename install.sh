@@ -2234,7 +2234,12 @@ __configure_dovecot() {
       printf 'introspection_mode = post\n'
       printf 'client_id = %s\n' "${FREEIPA_MAIL_KEYCLOAK_CLIENT_ID}"
       printf 'client_secret = %s\n' "${INSTALL_MAIL_KEYCLOAK_SECRET}"
-      printf 'username_attribute = preferred_username\n'
+      # 'email' not 'preferred_username': every other passdb (LDAP, PAM) and
+      # this stack's documented login convention use the full user@domain
+      # address. Keycloak's preferred_username claim has no domain, so
+      # matching on it would reject a full-email SASL login and silently
+      # fail through to the next passdb.
+      printf 'username_attribute = email\n'
       printf 'active_attribute = active\n'
       printf 'active_value = true\n'
     } > /etc/dovecot/dovecot-oauth2.conf.ext
