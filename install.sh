@@ -427,6 +427,10 @@ __detect_domain() {
       primary_domain="${FREEIPA_DOMAIN%.*}.${primary_domain}"
       __log "Complex domain detected; primary domain: ${primary_domain}"
     fi
+  elif [[ -n "${FREEIPA_DOMAIN}" ]]; then
+    # Hostname has no domain but the caller already provided one
+    FREEIPA_REALM="${FREEIPA_REALM:-${FREEIPA_DOMAIN^^}}"
+    FREEIPA_FQDN="${FREEIPA_FQDN}.${FREEIPA_DOMAIN}"
   else
     if [[ -t 0 ]]; then
       __warn "No domain found in hostname. Enter domain manually:"
