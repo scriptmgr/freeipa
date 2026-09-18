@@ -2504,7 +2504,7 @@ __main() {
 # - - - - - - - - - - - - - - - - - - - - - - - - -
 
 # Run main only when executed directly (not sourced)
-if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+if [[ "${BASH_SOURCE[0]:-${0}}" == "${0}" ]]; then
   __main "$@"
 fi
 
