@@ -261,7 +261,7 @@ __debug() {
 __help() {
   printf 'Usage: %s [OPTIONS]\n\n' "${APPNAME}"
   printf 'Full FreeIPA + Keycloak SSO bootstrap script — distro-agnostic.\n'
-  printf 'Installs FreeIPA with DNS, NTP, firewall, optional Let'"'"'s Encrypt,\n'
+  printf 'Installs FreeIPA with DNS, NTP, optional Let'"'"'s Encrypt,\n'
   printf 'and deploys Keycloak SSO federated against FreeIPA LDAP.\n\n'
   printf 'Options:\n'
   printf '  -h, --help        Show this help and exit\n'
@@ -274,7 +274,7 @@ __help() {
   printf '  FREEIPA_FQDN             Override auto-detected hostname\n'
   printf '  FREEIPA_DOMAIN           Override auto-detected domain\n'
   printf '  FREEIPA_REALM            Override auto-detected Kerberos realm\n'
-  printf '  FREEIPA_PORT             Override auto-detected reverse-proxy port\n'
+  printf '  FREEIPA_PORT             Reverse-proxy HTTPS port (default: random in 62000-64999)\n'
   printf '  FREEIPA_CRED_FILE        Credentials file path (default: /etc/ipa/creds.conf)\n'
   printf '  FREEIPA_DEBUG            Enable debug output when set to 1 (same as --debug)\n'
   printf '  FREEIPA_KEYCLOAK_PORT    Override Keycloak port (default: random in 62000-64999)\n'
@@ -288,7 +288,13 @@ __help() {
   printf '  FREEIPA_MAIL_LOCAL_FALLBACK   Add a Unix/PAM passdb fallback (default: true)\n'
   printf '  FREEIPA_MAIL_KEYCLOAK_AUTH    Add a Keycloak OAUTHBEARER passdb (default: true)\n'
   printf '  FREEIPA_MAIL_KEYCLOAK_CLIENT_ID  Keycloak client ID for token introspection (default: dovecot-mail)\n'
-  printf '  NO_COLOR                 Disable color output when set\n'
+  printf '  NO_COLOR                 Disable color output when set\n\n'
+  printf 'Notes:\n'
+  printf '  FREEIPA_PORT and FREEIPA_KEYCLOAK_PORT take precedence over the port\n'
+  printf '  recorded in FREEIPA_CRED_FILE, so a port can be pinned without editing\n'
+  printf '  the credentials file. FREEIPA_PORT is labelled http_port_t for httpd\n'
+  printf '  when semanage is available (an SELinux-enforcing host otherwise blocks\n'
+  printf '  the bind on a custom high port).\n'
 }
 
 __version() {
@@ -470,7 +476,7 @@ __install_packages() {
       fi
       __log "Installing FreeIPA packages via ${pkg_mgr}..."
       "${pkg_mgr}" update -y
-      "${pkg_mgr}" install -y ipa-server ipa-server-dns ipa-server-trust-ad bind-utils chrony firewalld openldap-clients
+      "${pkg_mgr}" install -y ipa-server ipa-server-dns ipa-server-trust-ad bind-utils chrony openldap-clients
       ;;
 
     # Fedora renamed the ipa-* packages to freeipa-* (RHEL/CentOS/Alma/Rocky
@@ -484,7 +490,7 @@ __install_packages() {
       fi
       __log "Installing FreeIPA packages via ${pkg_mgr}..."
       "${pkg_mgr}" update -y
-      "${pkg_mgr}" install -y freeipa-server freeipa-server-dns freeipa-server-trust-ad bind-utils chrony firewalld openldap-clients
+      "${pkg_mgr}" install -y freeipa-server freeipa-server-dns freeipa-server-trust-ad bind-utils chrony openldap-clients
       ;;
 
     # No freeipa-server package exists for Debian/Ubuntu/openSUSE: verified
@@ -717,122 +723,6 @@ __configure_ntp_settings() {
 
 # - - - - - - - - - - - - - - - - - - - - - - - - -
 
-# ─── Firewall ────────────────────────────────────────────────────────────────
-
-__configure_firewall() {
-  __log "Configuring firewall..."
-
-  if \command -v firewall-cmd >/dev/null 2>&1; then
-    __log "Detected firewalld; configuring..."
-    \systemctl enable firewalld
-    \systemctl start firewalld
-
-    \firewall-cmd --permanent --add-service=ssh
-    \firewall-cmd --permanent --add-service=http
-    \firewall-cmd --permanent --add-service=https
-    \firewall-cmd --permanent --add-service=freeipa-ldap
-    \firewall-cmd --permanent --add-service=freeipa-ldaps
-    \firewall-cmd --permanent --add-service=freeipa-replication
-
-    if [[ "${INSTALL_DNS}" == "true" ]]; then
-      \firewall-cmd --permanent --add-service=dns
-    fi
-
-    # Custom HTTPS port for the FreeIPA reverse proxy
-    \firewall-cmd --permanent --add-port="${FREEIPA_PORT}/tcp"
-
-    \firewall-cmd --permanent --add-service=kerberos
-    \firewall-cmd --permanent --add-service=ntp
-
-    # Keycloak port (internal Docker bridge — open for reverse proxy reach)
-    \firewall-cmd --permanent --add-port="${FREEIPA_KEYCLOAK_PORT}/tcp"
-    # Mail (Postfix/Dovecot)
-    \firewall-cmd --permanent --add-service=smtp
-    \firewall-cmd --permanent --add-port=587/tcp
-    \firewall-cmd --permanent --add-port=465/tcp
-    \firewall-cmd --permanent --add-service=imap
-    \firewall-cmd --permanent --add-service=imaps
-    \firewall-cmd --permanent --add-service=pop3
-    \firewall-cmd --permanent --add-service=pop3s
-    # Mosh server uses UDP 60000-61000 for encrypted remote terminal sessions
-    \firewall-cmd --permanent --add-port=60000-61000/udp
-    # Allow ICMP ping for monitoring
-    \firewall-cmd --permanent --remove-icmp-block=echo-request 2>/dev/null || true
-    \firewall-cmd --permanent --remove-icmp-block=echo-reply 2>/dev/null || true
-
-    \firewall-cmd --reload
-
-    __log "firewalld configured"
-
-  elif \command -v ufw >/dev/null 2>&1; then
-    __log "Detected UFW; configuring..."
-    \ufw --force enable
-
-    # SSH
-    \ufw allow 22/tcp
-    # HTTP / HTTPS
-    \ufw allow 80/tcp
-    \ufw allow 443/tcp
-    # Custom HTTPS port for the FreeIPA reverse proxy
-    \ufw allow "${FREEIPA_PORT}/tcp"
-    # LDAP
-    \ufw allow 389/tcp
-    # LDAPS
-    \ufw allow 636/tcp
-    # Kerberos TCP
-    \ufw allow 88/tcp
-    # Kerberos UDP
-    \ufw allow 88/udp
-    # Kerberos kpasswd TCP
-    \ufw allow 464/tcp
-    # Kerberos kpasswd UDP
-    \ufw allow 464/udp
-    # NTP
-    \ufw allow 123/udp
-
-    if [[ "${INSTALL_DNS}" == "true" ]]; then
-      \ufw allow 53/tcp
-      \ufw allow 53/udp
-    fi
-
-    # Keycloak port
-    \ufw allow "${FREEIPA_KEYCLOAK_PORT}/tcp"
-    # Mail (Postfix/Dovecot)
-    \ufw allow 25/tcp
-    \ufw allow 587/tcp
-    \ufw allow 465/tcp
-    \ufw allow 143/tcp
-    \ufw allow 993/tcp
-    \ufw allow 110/tcp
-    \ufw allow 995/tcp
-    # Mosh server uses UDP 60000-61000 for encrypted remote terminal sessions
-    \ufw allow 60000:61000/udp
-    # Allow ICMP ping — inject into before.rules if not already present
-    if [ -f /etc/ufw/before.rules ] && ! \grep -q -- "# ICMP ping allow" /etc/ufw/before.rules 2>/dev/null; then
-      \sed -i \
-        '/^COMMIT$/i # ICMP ping allow\n-A ufw-before-input -p icmp --icmp-type echo-request -j ACCEPT\n-A ufw-before-input -p icmp --icmp-type echo-reply -j ACCEPT' \
-        /etc/ufw/before.rules 2>/dev/null || true
-    fi
-
-    __log "UFW configured"
-  else
-    __log "No supported firewall found; skipping firewall configuration"
-  fi
-
-  # firewalld's --reload and ufw's enable/allow calls rewrite the host's
-  # iptables/nftables ruleset, which wipes or reorders the DOCKER/DOCKER-*
-  # forwarding chains Docker installed at daemon-start time. Left alone,
-  # this silently drops inter-container traffic on Docker's bridge networks
-  # (observed as Keycloak losing its Postgres connection). Restarting Docker
-  # here makes it reinstall its rules on top of the final firewall state.
-  if \systemctl is-active --quiet docker 2>/dev/null; then
-    __log "Restarting Docker to reinstall its network rules after firewall changes..."
-    \systemctl restart docker
-  fi
-}
-
-# - - - - - - - - - - - - - - - - - - - - - - - - -
-
 # ─── Let's Encrypt renewal hook ──────────────────────────────────────────────
 
 __configure_letsencrypt_renewal() {
@@ -956,6 +846,22 @@ __install_freeipa() {
 
 __configure_reverse_proxy() {
   __log "Configuring FreeIPA for reverse proxy setup..."
+
+  # Label FREEIPA_PORT for httpd before starting it. http_port_t only covers
+  # 80/81/443/488/8008/8009/8443/9000, so on an SELinux-enforcing RHEL-family
+  # host a custom high port is denied at bind time with a bare
+  # "make_sock: could not bind" / AH00072 and httpd exits status 1. Add the
+  # port to http_port_t so httpd is permitted to bind it. Use -m first so a
+  # re-run against an already-labelled port is a no-op rather than an error.
+  if \command -v semanage >/dev/null 2>&1; then
+    if \semanage port -m -t http_port_t -p tcp "${FREEIPA_PORT}" 2>/dev/null; then
+      __log "Relabelled existing SELinux port ${FREEIPA_PORT} as http_port_t"
+    elif \semanage port -a -t http_port_t -p tcp "${FREEIPA_PORT}" 2>/dev/null; then
+      __log "Labelled port ${FREEIPA_PORT} as http_port_t for httpd"
+    else
+      __warn "Could not label port ${FREEIPA_PORT} as http_port_t; httpd may fail to bind if SELinux is enforcing"
+    fi
+  fi
 
   local apache_conf_dir=""
   local ssl_conf="" rewrite_conf=""
@@ -1336,11 +1242,15 @@ __install_keycloak_docker() {
     __save_credential "${FREEIPA_CRED_FILE}" INSTALL_KEYCLOAK_DB_PASSWORD "${INSTALL_KEYCLOAK_DB_PASSWORD}"
   }
 
-  # Load or generate stable Keycloak port
-  FREEIPA_KEYCLOAK_PORT="$(__load_credential "${FREEIPA_CRED_FILE}" FREEIPA_KEYCLOAK_PORT)" || {
-    FREEIPA_KEYCLOAK_PORT="$(__random_port)"
-    __save_credential "${FREEIPA_CRED_FILE}" FREEIPA_KEYCLOAK_PORT "${FREEIPA_KEYCLOAK_PORT}"
-  }
+  # FREEIPA_KEYCLOAK_PORT is resolved once in __main (env override > saved
+  # credential > random); don't re-read it here or a caller-supplied value gets
+  # silently discarded.
+  if [[ -z "${FREEIPA_KEYCLOAK_PORT}" ]]; then
+    FREEIPA_KEYCLOAK_PORT="$(__load_credential "${FREEIPA_CRED_FILE}" FREEIPA_KEYCLOAK_PORT)" || {
+      FREEIPA_KEYCLOAK_PORT="$(__random_port)"
+      __save_credential "${FREEIPA_CRED_FILE}" FREEIPA_KEYCLOAK_PORT "${FREEIPA_KEYCLOAK_PORT}"
+    }
+  fi
 
   local primary_ip
   primary_ip="$(__primary_ip)"
@@ -1892,6 +1802,9 @@ __configure_ad_trust() {
 
   printf '%s\n' "${INSTALL_ADMIN_PASSWORD}" | \kinit "admin@${FREEIPA_REALM}"
 
+  # Note: ipa-adtrust-install does not support GSSAPI or stdin password input.
+  # The admin password appears in process arguments briefly during execution.
+  # This is a known limitation of the tool.
   if ! \ipa-adtrust-install -U -a "${INSTALL_ADMIN_PASSWORD}" --add-sids; then
     __warn "ipa-adtrust-install failed — AD trust support was not configured; run it manually if needed"
     return 0
@@ -1990,6 +1903,16 @@ __setup_freeipa_for_mail() {
   \kdestroy 2>/dev/null || true
 
   \mkdir -p /etc/mail/certs
+  # certmonger must be able to create its key and certificate here under
+  # enforcing SELinux; cert_t is the writable certificate-file context.
+  # Guarded because semanage ships in policycoreutils-python-utils, which only
+  # arrives transitively via ipa-server-common; it is absent on a Debian-family
+  # host and restorecon is equally optional there.
+  if \command -v semanage >/dev/null 2>&1; then
+    \semanage fcontext -a -t cert_t "/etc/mail/certs(/.*)?" 2>/dev/null ||
+      \semanage fcontext -m -t cert_t "/etc/mail/certs(/.*)?" 2>/dev/null || true
+  fi
+  \restorecon -RF /etc/mail/certs 2>/dev/null || true
   INSTALL_MAIL_CERT_PATH="/etc/mail/certs/mail.pem"
   INSTALL_MAIL_KEY_PATH="/etc/mail/certs/mail.key"
 
@@ -2470,17 +2393,23 @@ __main() {
   __migrate_legacy_credential_file "${FREEIPA_CRED_FILE}"
   __migrate_legacy_credential_keys "${FREEIPA_CRED_FILE}"
 
-  # Load or pick stable ports for this installation — both must be set before __configure_firewall
-  FREEIPA_PORT="$(__load_credential "${FREEIPA_CRED_FILE}" FREEIPA_PORT)" || {
-    FREEIPA_PORT="$(__random_port)"
-    __save_credential "${FREEIPA_CRED_FILE}" FREEIPA_PORT "${FREEIPA_PORT}"
-  }
+  # Load or pick stable ports for this installation.
+  # A caller-supplied FREEIPA_PORT/FREEIPA_KEYCLOAK_PORT wins over the saved credential, so
+  # an operator can pin ports without having to hand-edit /etc/ipa/creds.conf first.
+  if [[ -z "${FREEIPA_PORT}" ]]; then
+    FREEIPA_PORT="$(__load_credential "${FREEIPA_CRED_FILE}" FREEIPA_PORT)" || {
+      FREEIPA_PORT="$(__random_port)"
+      __save_credential "${FREEIPA_CRED_FILE}" FREEIPA_PORT "${FREEIPA_PORT}"
+    }
+  fi
   __log "Selected FreeIPA port: ${FREEIPA_PORT}"
 
-  FREEIPA_KEYCLOAK_PORT="$(__load_credential "${FREEIPA_CRED_FILE}" FREEIPA_KEYCLOAK_PORT)" || {
-    FREEIPA_KEYCLOAK_PORT="$(__random_port)"
-    __save_credential "${FREEIPA_CRED_FILE}" FREEIPA_KEYCLOAK_PORT "${FREEIPA_KEYCLOAK_PORT}"
-  }
+  if [[ -z "${FREEIPA_KEYCLOAK_PORT}" ]]; then
+    FREEIPA_KEYCLOAK_PORT="$(__load_credential "${FREEIPA_CRED_FILE}" FREEIPA_KEYCLOAK_PORT)" || {
+      FREEIPA_KEYCLOAK_PORT="$(__random_port)"
+      __save_credential "${FREEIPA_CRED_FILE}" FREEIPA_KEYCLOAK_PORT "${FREEIPA_KEYCLOAK_PORT}"
+    }
+  fi
   __log "Selected Keycloak port: ${FREEIPA_KEYCLOAK_PORT}"
 
   __install_prerequisites
@@ -2489,7 +2418,6 @@ __main() {
   __configure_ntp_settings
   __configure_ssl_certs
   __configure_dns_settings
-  __configure_firewall
   __install_freeipa
   __configure_reverse_proxy
   __derive_ldap_base_dn

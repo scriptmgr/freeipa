@@ -1,6 +1,6 @@
 # freeipa
 
-Full [FreeIPA](https://www.freeipa.org/) + [Keycloak](https://www.keycloak.org/) SSO bootstrap for any major Linux distribution — installs FreeIPA with DNS, NTP, and firewall configuration, then deploys Keycloak via Docker and federates it against FreeIPA LDAP for centralized single sign-on. Also configures Postfix and Dovecot for LDAP/TLS-authenticated mail against the same FreeIPA directory. Idempotent and non-interactive.
+Full [FreeIPA](https://www.freeipa.org/) + [Keycloak](https://www.keycloak.org/) SSO bootstrap for any major Linux distribution — installs FreeIPA with DNS and NTP, then deploys Keycloak via Docker and federates it against FreeIPA LDAP for centralized single sign-on. Also configures Postfix and Dovecot for LDAP/TLS-authenticated mail against the same FreeIPA directory. Idempotent and non-interactive.
 
 ---
 
@@ -30,16 +30,15 @@ bash install.sh
 3. **Installs prerequisites** — Docker CE and `jq`, skipped if already present
 4. **Configures `/etc/hosts`, NTP/Chrony, and DNS forwarders** automatically
 5. **Selects SSL certificates** — reuses an existing Let's Encrypt certificate if found, otherwise falls back to FreeIPA's built-in CA
-6. **Configures the firewall** — `firewalld` or `ufw`, opening SSH/HTTP/HTTPS, LDAP/LDAPS, Kerberos, NTP, DNS (if integrated DNS is enabled), the FreeIPA reverse-proxy port, and the Keycloak port
-7. **Installs and configures FreeIPA** (`ipa-server-install --unattended`), generating and saving the admin and Directory Manager passwords
-8. **Configures Apache for reverse-proxy use** on a random high port so an external reverse proxy can front FreeIPA
-9. **Federates Keycloak against FreeIPA LDAP** — creates a `keycloak` LDAP bind account, an `HTTP` Kerberos service principal, and exports a keytab plus the IPA CA certificate
-10. **Deploys Keycloak via Docker Compose** — Postgres + Keycloak, with Kerberos SPNEGO wired to FreeIPA
-11. **Configures the Keycloak realm over its REST API** — creates the realm, the LDAP user federation component, triggers a full sync, and promotes the admin user to `realm-admin`
-12. **Writes an nginx vhost for Keycloak**, if nginx is installed
-13. **Configures AD trust support** (`ipa-adtrust-install --add-sids`), unconditionally — RHEL-family and Fedora only, since no working `freeipa-server` package exists for Debian/Ubuntu/openSUSE (see [Supported distributions](#supported-distributions))
-14. **Installs and configures Postfix and Dovecot** — LDAP-authenticated virtual mailboxes backed by FreeIPA, with an IPA-issued, certmonger-tracked TLS certificate shared by both. Postfix accepts mail for `FREEIPA_MAIL_DOMAIN` and any `*.FREEIPA_MAIL_DOMAIN` subdomain (via a `regexp:` virtual-domain map — Postfix has no native glob syntax). Dovecot also supports a Unix/PAM local-account fallback (tried when a user isn't found in LDAP) and Keycloak OAUTHBEARER/XOAUTH2 via token introspection for IMAP/POP3 clients that support it — both on by default, each independently toggleable
-15. Prints an installation summary with access URLs, credential locations, and next steps
+6. **Installs and configures FreeIPA** (`ipa-server-install --unattended`), generating and saving the admin and Directory Manager passwords
+7. **Configures Apache for reverse-proxy use** on a random high port so an external reverse proxy can front FreeIPA
+8. **Federates Keycloak against FreeIPA LDAP** — creates a `keycloak` LDAP bind account, an `HTTP` Kerberos service principal, and exports a keytab plus the IPA CA certificate
+9. **Deploys Keycloak via Docker Compose** — Postgres + Keycloak, with Kerberos SPNEGO wired to FreeIPA
+10. **Configures the Keycloak realm over its REST API** — creates the realm, the LDAP user federation component, triggers a full sync, and promotes the admin user to `realm-admin`
+11. **Writes an nginx vhost for Keycloak**, if nginx is installed
+12. **Configures AD trust support** (`ipa-adtrust-install --add-sids`), unconditionally — RHEL-family and Fedora only, since no working `freeipa-server` package exists for Debian/Ubuntu/openSUSE (see [Supported distributions](#supported-distributions))
+13. **Installs and configures Postfix and Dovecot** — LDAP-authenticated virtual mailboxes backed by FreeIPA, with an IPA-issued, certmonger-tracked TLS certificate shared by both. Postfix accepts mail for `FREEIPA_MAIL_DOMAIN` and any `*.FREEIPA_MAIL_DOMAIN` subdomain (via a `regexp:` virtual-domain map — Postfix has no native glob syntax). Dovecot also supports a Unix/PAM local-account fallback (tried when a user isn't found in LDAP) and Keycloak OAUTHBEARER/XOAUTH2 via token introspection for IMAP/POP3 clients that support it — both on by default, each independently toggleable
+14. Prints an installation summary with access URLs, credential locations, and next steps
 
 All steps are idempotent — re-running the script detects existing installs (FreeIPA, the Keycloak container, generated credentials) and skips them.
 
@@ -79,7 +78,7 @@ on Debian/Ubuntu/openSUSE rather than attempting a broken install.
 | `FREEIPA_FQDN` | auto-detected | Override the detected hostname |
 | `FREEIPA_DOMAIN` | auto-detected | Override the detected domain |
 | `FREEIPA_REALM` | auto-detected | Override the detected Kerberos realm |
-| `FREEIPA_PORT` | auto-detected | Override the detected reverse-proxy port |
+| `FREEIPA_PORT` | random, 62000–64999 | Reverse-proxy HTTPS port; labelled `http_port_t` for httpd when `semanage` is present |
 | `FREEIPA_CRED_FILE` | `/etc/ipa/creds.conf` | Generated-credentials file path |
 | `FREEIPA_DEBUG` | `0` | Enable debug output when set to `1` (same as `--debug`) |
 | `FREEIPA_KEYCLOAK_PORT` | random, 62000–64999 | Keycloak HTTP port |
@@ -92,7 +91,12 @@ on Debian/Ubuntu/openSUSE rather than attempting a broken install.
 | `FREEIPA_MAIL_VID` | `5000` | UID and GID for `FREEIPA_MAIL_VUSER` (single ID shared by both) |
 | `FREEIPA_MAIL_LOCAL_FALLBACK` | `true` | Add a Unix/PAM passdb tried when a user isn't found in LDAP |
 | `FREEIPA_MAIL_KEYCLOAK_AUTH` | `true` | Add a Keycloak OAUTHBEARER/XOAUTH2 passdb (IMAP/POP3 only) |
+| `FREEIPA_MAIL_KEYCLOAK_CLIENT_ID` | `dovecot-mail` | Keycloak client ID whose tokens the Dovecot passdb introspects |
 | `NO_COLOR` | unset | Disable color output when set |
+
+`FREEIPA_PORT` and `FREEIPA_KEYCLOAK_PORT` take precedence over the port recorded
+in `FREEIPA_CRED_FILE`, so a port can be pinned without hand-editing the
+credentials file.
 
 **Keycloak mail client note:** the confidential `dovecot-mail` client created for
 token introspection only authenticates Dovecot to Keycloak — it does not issue
@@ -226,7 +230,8 @@ NSS-based identity resolution.
 
 ## 🛠️ Development
 
-The project is a single shell script. No build step required.
+The project is a single setup script, `install.sh`, plus the optional `client.sh`
+enrollment helper. No build step required.
 
 ```bash
 git clone https://github.com/scriptmgr/freeipa.git
