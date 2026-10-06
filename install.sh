@@ -820,12 +820,15 @@ __install_freeipa() {
 
   if [[ "${INSTALL_USE_LETSENCRYPT}" == "true" ]]; then
     __log "Using Let's Encrypt certificates"
+    # ipa-server-install has no *-key-file options: --http-cert-file and
+    # --dirsrv-cert-file each take the certificate and the private key as
+    # separate files, so each option is passed twice. The key is unencrypted
+    # (certbot privkey.pem), so no --*-pin is needed.
     install_cmd+=(
       "--http-cert-file=${INSTALL_FULLCHAIN_PATH}"
-      "--http-key-file=${INSTALL_KEY_PATH}"
+      "--http-cert-file=${INSTALL_KEY_PATH}"
       "--dirsrv-cert-file=${INSTALL_FULLCHAIN_PATH}"
-      "--dirsrv-key-file=${INSTALL_KEY_PATH}"
-      "--dirsrv-pin="
+      "--dirsrv-cert-file=${INSTALL_KEY_PATH}"
     )
   fi
 
@@ -1656,9 +1659,19 @@ __configure_keycloak_mail_client() {
       protocol: "openid-connect",
       publicClient: false,
       standardFlowEnabled: false,
-      directAccessGrantsEnabled: false,
+      directAccessGrantsEnabled: true,
       serviceAccountsEnabled: true,
-      secret: $secret
+      secret: $secret,
+      protocolMappers: [{
+        name: "dovecot-audience",
+        protocol: "openid-connect",
+        protocolMapper: "oidc-audience-mapper",
+        config: {
+          "included.client.audience": $cid,
+          "id.token.claim": "false",
+          "access.token.claim": "true"
+        }
+      }]
     }')"
 
   if [[ -n "${existing_client_id}" && "${existing_client_id}" != "null" ]]; then
@@ -2104,6 +2117,38 @@ __configure_postfix() {
 
 # ─── Dovecot configuration ───────────────────────────────────────────────────
 
+# Allow dovecot_auth_t to reach the Keycloak introspection port under SELinux.
+__allow_dovecot_keycloak_selinux() {
+  if ! \command -v checkmodule >/dev/null 2>&1 || ! \command -v semodule_package >/dev/null 2>&1; then
+    local _pm="dnf"
+    \command -v dnf >/dev/null 2>&1 || _pm="yum"
+    "${_pm}" install -y checkpolicy policycoreutils >/dev/null 2>&1 || true
+  fi
+  if ! \command -v checkmodule >/dev/null 2>&1 || ! \command -v semodule_package >/dev/null 2>&1; then
+    __warn "checkmodule/semodule_package unavailable; Dovecot may be unable to reach Keycloak under SELinux"
+    return 0
+  fi
+  if \command -v semanage >/dev/null 2>&1; then
+    \semanage port -m -t http_port_t -p tcp "${FREEIPA_KEYCLOAK_PORT}" 2>/dev/null \
+      || \semanage port -a -t http_port_t -p tcp "${FREEIPA_KEYCLOAK_PORT}" 2>/dev/null || true
+  fi
+  local _dir
+  _dir="$(\mktemp -d)"
+  {
+    printf 'module scriptmgr_dovecot_keycloak 1.0;\n\n'
+    printf 'require {\n  type dovecot_auth_t;\n  type http_port_t;\n  class tcp_socket name_connect;\n}\n\n'
+    printf 'allow dovecot_auth_t http_port_t:tcp_socket name_connect;\n'
+  } > "${_dir}/scriptmgr_dovecot_keycloak.te"
+  if \checkmodule -M -m -o "${_dir}/scriptmgr_dovecot_keycloak.mod" "${_dir}/scriptmgr_dovecot_keycloak.te" >/dev/null 2>&1 \
+    && \semodule_package -o "${_dir}/scriptmgr_dovecot_keycloak.pp" -m "${_dir}/scriptmgr_dovecot_keycloak.mod" >/dev/null 2>&1 \
+    && \semodule -i "${_dir}/scriptmgr_dovecot_keycloak.pp" >/dev/null 2>&1; then
+    __log "SELinux: allowed Dovecot to connect to Keycloak port ${FREEIPA_KEYCLOAK_PORT}"
+  else
+    __warn "Could not install SELinux policy module for Dovecot -> Keycloak"
+  fi
+  \rm -rf "${_dir}"
+}
+
 __configure_dovecot() {
   __log "Configuring Dovecot..."
 
@@ -2149,13 +2194,13 @@ __configure_dovecot() {
   # Command substitution strips trailing newlines, so each block ends with an
   # explicit newline appended outside $(...) — otherwise concatenated blocks
   # glue together onto one line and dovecot.conf fails to parse
-  passdb_blocks="$(printf 'passdb {\n  driver = ldap\n  args = /etc/dovecot/dovecot-ldap.conf.ext\n}')"$'\n'
+  passdb_blocks="$(printf 'passdb {\n  driver = ldap\n  args = /etc/dovecot/dovecot-ldap.conf.ext\n  mechanisms = plain login\n}')"$'\n'
   userdb_blocks="$(printf 'userdb {\n  driver = ldap\n  args = /etc/dovecot/dovecot-ldap.conf.ext\n}')"$'\n'
 
   # Local Unix fallback — tried only when LDAP reports the user as unknown,
   # so FreeIPA-directory users always authenticate via LDAP first
   if [[ "${FREEIPA_MAIL_LOCAL_FALLBACK}" == "true" ]]; then
-    passdb_blocks+="$(printf 'passdb {\n  driver = pam\n  args = dovecot\n}')"$'\n'
+    passdb_blocks+="$(printf 'passdb {\n  driver = pam\n  args = dovecot\n  mechanisms = plain login\n}')"$'\n'
     userdb_blocks+="$(printf 'userdb {\n  driver = passwd\n  override_fields = mail=maildir:~/Maildir\n}')"$'\n'
   fi
 
@@ -2172,14 +2217,23 @@ __configure_dovecot() {
       # 'email' not 'preferred_username': every other passdb (LDAP, PAM) and
       # this stack's documented login convention use the full user@domain
       # address. Keycloak's preferred_username claim has no domain, so
-      # matching on it would reject a full-email SASL login and silently
-      # fail through to the next passdb.
+      # matching on it would reject a full-email SASL login. Verified:
+      # a full-email XOAUTH2 login succeeds with email, fails with
+      # preferred_username.
       printf 'username_attribute = email\n'
       printf 'active_attribute = active\n'
       printf 'active_value = true\n'
     } > /etc/dovecot/dovecot-oauth2.conf.ext
     \chown root:dovecot /etc/dovecot/dovecot-oauth2.conf.ext
     \chmod 640 /etc/dovecot/dovecot-oauth2.conf.ext
+
+    # On an SELinux-enforcing host dovecot_auth_t may not connect to the
+    # Keycloak port (introspection then fails with "Permission denied" and
+    # every OAUTHBEARER/XOAUTH2 login is a temporary failure). Label the port
+    # http_port_t and allow that one connection with a small local policy module.
+    if \command -v getenforce >/dev/null 2>&1 && [[ "$(\getenforce 2>/dev/null)" != "Disabled" ]]; then
+      __allow_dovecot_keycloak_selinux
+    fi
 
     passdb_blocks+="$(printf 'passdb {\n  driver = oauth2\n  mechanisms = xoauth2 oauthbearer\n  args = /etc/dovecot/dovecot-oauth2.conf.ext\n}')"$'\n'
   fi
