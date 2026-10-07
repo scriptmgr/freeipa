@@ -113,7 +113,8 @@ without a matching audience as inactive.
 `client.sh` joins the current host to the FreeIPA realm built by `install.sh`. It
 detects the distro, sets a fully-qualified hostname, installs the client packages,
 and runs `ipa-client-install` — which registers the host's directory entry and
-keytab and configures SSSD/Kerberos.
+keytab and configures SSSD/Kerberos. Re-running it on an already-enrolled host skips enrollment (no credentials needed) and
+verifies the enrollment instead; a host enrolled in a different realm is refused.
 
 ```bash
 FREEIPA_SERVER=ipa.example.com \

@@ -257,11 +257,30 @@ __check_root() {
   fi
 }
 
+# True when this host already ran ipa-client-install (RHEL-style flow only).
+__already_enrolled() {
+  [[ -f /etc/ipa/default.conf && -s /etc/krb5.keytab ]]
+}
+
+# A host enrolled in a different realm is an error, never silently reused.
+__check_enrolled_realm() {
+  local enrolled_realm
+  enrolled_realm="$(\sed -n 's/^realm[[:space:]]*=[[:space:]]*//p' /etc/ipa/default.conf | \head -n1)"
+  if [[ -n "${enrolled_realm}" && -n "${FREEIPA_REALM}" && "${enrolled_realm^^}" != "${FREEIPA_REALM^^}" ]]; then
+    __error "This host is already enrolled in realm ${enrolled_realm}, not ${FREEIPA_REALM}; run ipa-client-install --uninstall first"
+  fi
+}
+
 __check_args() {
   if [[ -z "${FREEIPA_SERVER}" ]]; then
-    __error "FREEIPA_SERVER (or --server=HOST) is required"
+    # An enrolled host knows its own server; fall back to it for re-runs
+    if [[ "${1:-}" == "enrolled" ]]; then
+      FREEIPA_SERVER="$(\sed -n 's/^server[[:space:]]*=[[:space:]]*//p' /etc/ipa/default.conf | \head -n1)"
+    fi
+    [[ -n "${FREEIPA_SERVER}" ]] || __error "FREEIPA_SERVER (or --server=HOST) is required"
   fi
-  if [[ -n "${FREEIPA_OTP}" ]]; then
+  # Already enrolled: nothing to authenticate, enrollment is skipped
+  if [[ "${1:-}" == "enrolled" || -n "${FREEIPA_OTP}" ]]; then
     return 0
   fi
   if [[ -z "${FREEIPA_ADMIN_PASSWORD}" ]]; then
@@ -462,11 +481,16 @@ __enroll_client() {
 __verify_enrollment() {
   __log "Verifying enrollment..."
 
-  if \getent passwd "${FREEIPA_ADMIN_PRINCIPAL}" >/dev/null 2>&1; then
-    __log "SSSD resolves ${FREEIPA_ADMIN_PRINCIPAL} via the directory"
-  else
-    __warn "getent could not resolve ${FREEIPA_ADMIN_PRINCIPAL}; SSSD may still be starting"
-  fi
+  # SSSD can take a few seconds to answer after enrollment; retry, then fail
+  local attempt=0
+  until \getent passwd "${FREEIPA_ADMIN_PRINCIPAL}" >/dev/null 2>&1; do
+    attempt=$(( attempt + 1 ))
+    if [[ "${attempt}" -ge 10 ]]; then
+      __error "SSSD cannot resolve ${FREEIPA_ADMIN_PRINCIPAL} through the directory after enrollment (exit 72)"
+    fi
+    sleep 3
+  done
+  __log "SSSD resolves ${FREEIPA_ADMIN_PRINCIPAL} via the directory"
 
   # The Arch path (__enroll_arch_client) never registers this host's own
   # directory entry/keytab — see its header comment — so a host/<fqdn>
@@ -479,7 +503,7 @@ __verify_enrollment() {
     __log "Host keytab authenticates successfully"
     \kdestroy >/dev/null 2>&1 || true
   else
-    __warn "Host keytab authentication check failed; inspect /var/log/sssd/ for details"
+    __error "Host keytab authentication failed; inspect /var/log/sssd/ for details (exit 73)"
   fi
 }
 
@@ -861,18 +885,31 @@ __main() {
   __check_root
   __migrate_legacy_credential_file "${FREEIPA_CRED_FILE}"
   __detect_distro
-  __check_args
-  __configure_hostname
-  __install_client_packages
 
-  if [[ "${INSTALL_DISTRO_FAMILY}" == *alpine* ]]; then
-    __enroll_alpine_client
-  elif [[ "${INSTALL_DISTRO_FAMILY}" == *arch* ]]; then
-    __enroll_arch_client
+  local enrolled=""
+  if [[ "${INSTALL_DISTRO_FAMILY}" != *alpine* && "${INSTALL_DISTRO_FAMILY}" != *arch* ]] && __already_enrolled; then
+    enrolled="enrolled"
+  fi
+
+  __check_args "${enrolled}"
+  __configure_hostname
+
+  if [[ -n "${enrolled}" ]]; then
+    __check_enrolled_realm
+    __log "Host is already enrolled in ${FREEIPA_REALM}; skipping enrollment and verifying it instead"
     __verify_enrollment
   else
-    __enroll_client
-    __verify_enrollment
+    __install_client_packages
+
+    if [[ "${INSTALL_DISTRO_FAMILY}" == *alpine* ]]; then
+      __enroll_alpine_client
+    elif [[ "${INSTALL_DISTRO_FAMILY}" == *arch* ]]; then
+      __enroll_arch_client
+      __verify_enrollment
+    else
+      __enroll_client
+      __verify_enrollment
+    fi
   fi
 
   __display_summary
