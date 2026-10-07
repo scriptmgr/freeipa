@@ -758,10 +758,17 @@ rc=0
 
 # Make IPA trust the issuing chain so ipa-server-certinstall can validate it
 # and IPA clients/Keycloak/Dovecot verify LDAPS against /etc/ipa/ca.crt.
-if [ -f "${CHAIN_PATH}" ] && printf '%s\n' "${ADMIN_PASS}" | kinit admin >/dev/null 2>&1; then
-  ipa-cacert-manage install -t C,, "${CHAIN_PATH}" >/dev/null 2>&1 || true
-  ipa-certupdate >/dev/null 2>&1 || true
-  kdestroy >/dev/null 2>&1 || true
+if [ -f "${CHAIN_PATH}" ]; then
+  if printf '%s\n' "${ADMIN_PASS}" | kinit admin >/dev/null 2>&1; then
+    if ! out="$(ipa-cacert-manage install -t C,, "${CHAIN_PATH}" 2>&1)"; then
+      printf '%s\n' "${out}" | grep -qi 'already' || { printf '%s\n' "${out}" >&2; rc=1; }
+    fi
+    ipa-certupdate >/dev/null 2>&1 || rc=1
+    kdestroy >/dev/null 2>&1 || true
+  else
+    echo "kinit admin failed" >&2
+    rc=1
+  fi
 fi
 
 ipa-server-certinstall -d --pin= -p "${DM_PASS}" "${KEY_PATH}" "${CERT_PATH}" || rc=1
@@ -783,7 +790,7 @@ HOOKEOF
   __log "Renewal hook created: ${hook}"
 
   if ! RENEWED_LINEAGE="${INSTALL_FULLCHAIN_PATH%/*}" "${hook}"; then
-    __warn "Could not install the Let's Encrypt certificate on HTTPS/LDAPS; FreeIPA keeps its IPA-issued certificate"
+    __error "Could not install the Let's Encrypt certificate on HTTPS/LDAPS (exit 71)"
   fi
 }
 
@@ -922,8 +929,9 @@ EOF
   # ssl.conf has <VirtualHost _default_:443> — change it to accept both ports.
   # This avoids duplicating any of the WSGI/SSL directives.
   if [[ -f "${ssl_conf}" ]]; then
-    \sed -i "s|<VirtualHost _default_:443>|<VirtualHost _default_:443 _default_:${FREEIPA_PORT}>|" \
-      "${ssl_conf}" 2>/dev/null || true
+    \sed -i "s|<VirtualHost _default_:443>|<VirtualHost _default_:443 _default_:${FREEIPA_PORT}>|" "${ssl_conf}"
+    \grep -q -- "_default_:${FREEIPA_PORT}>" "${ssl_conf}" \
+      || __error "ssl.conf VirtualHost does not listen on ${FREEIPA_PORT} after editing ${ssl_conf}"
     __log "Extended ssl.conf VirtualHost to also listen on port ${FREEIPA_PORT}"
   fi
 
@@ -933,9 +941,13 @@ EOF
   if [[ -f "${rewrite_conf}" ]]; then
     # Insert an extra RewriteCond to exclude our custom port, immediately after
     # the existing !^443$ condition line.
-    if ! \grep -q -- "!^${FREEIPA_PORT}\$" "${rewrite_conf}" 2>/dev/null; then
+    # -F: the inserted line ends in a literal "$" (an Apache regex anchor), so a
+    # regex grep would treat it as end-of-line and never match
+    if ! \grep -qF -- "!^${FREEIPA_PORT}\$" "${rewrite_conf}" 2>/dev/null; then
       \sed -i "/RewriteCond %{SERVER_PORT}[[:space:]]*!\^443\\\$/a RewriteCond %{SERVER_PORT}  !^${FREEIPA_PORT}$" \
-        "${rewrite_conf}" 2>/dev/null || true
+        "${rewrite_conf}"
+      \grep -qF -- "!^${FREEIPA_PORT}\$" "${rewrite_conf}" \
+        || __error "ipa-rewrite.conf was not patched for port ${FREEIPA_PORT}"
       __log "Patched ipa-rewrite.conf to skip redirect for port ${FREEIPA_PORT}"
     fi
   fi
@@ -1014,7 +1026,9 @@ EOF
   # this by being Include'd from inside that VirtualHost (see ssl.conf) —
   # mirror that exact pattern here, idempotently.
   if [[ -f "${ssl_conf}" ]] && ! \grep -q -- "Include ${kc_conf}" "${ssl_conf}" 2>/dev/null; then
-    \sed -i "/^Include .*ipa-rewrite\.conf\$/a Include ${kc_conf}" "${ssl_conf}" 2>/dev/null || true
+    \sed -i "/^Include .*ipa-rewrite\.conf\$/a Include ${kc_conf}" "${ssl_conf}"
+    \grep -q -- "Include ${kc_conf}" "${ssl_conf}" \
+      || __error "Keycloak proxy include was not added to ${ssl_conf}"
     __log "Included freeipa-keycloak-proxy.conf inside the SSL VirtualHost"
   fi
 
@@ -1186,7 +1200,7 @@ __setup_freeipa_for_keycloak() {
       printf 'changetype: modify\n'
       printf 'replace: userPassword\n'
       printf 'userPassword: {CLEAR}%s\n' "${INSTALL_KEYCLOAK_LDAP_PASSWORD}"
-    } | \ldapmodify -Y GSSAPI -H "ldap://${FREEIPA_FQDN}" || true
+    } | \ldapmodify -Y GSSAPI -H "ldap://${FREEIPA_FQDN}"
   fi
 
   # Remove LDIF immediately — it contained a cleartext password
@@ -1194,7 +1208,7 @@ __setup_freeipa_for_keycloak() {
   INSTALL_LDIF_TMP=""
 
   # Create HTTP service principal for Kerberos SPNEGO
-  \ipa service-add "HTTP/${FREEIPA_FQDN}" 2>/dev/null || true
+  __ipa_service_add "HTTP/${FREEIPA_FQDN}"
 
   # Export keytab for Keycloak
   \ipa-getkeytab -p "HTTP/${FREEIPA_FQDN}@${FREEIPA_REALM}" -k "${FREEIPA_KEYCLOAK_CONFIG_DIR}/keycloak.keytab"
@@ -1457,6 +1471,39 @@ __keycloak_admin_token() {
 
 # - - - - - - - - - - - - - - - - - - - - - - - - -
 
+# ─── Keycloak REST call helper ───────────────────────────────────────────────
+
+# Run one Keycloak admin REST call and fail the install on any non-2xx answer,
+# so a rejected request can never be reported as a configured step.
+# Usage: __kc_call <METHOD> <path> [json-body]
+# Sets KC_BODY (response body) and KC_LOCATION (Location header, if any).
+__kc_call() {
+  local method="${1:?}" path="${2:?}" body="${3:-}"
+  local token hdr out code
+  token="$(__keycloak_admin_token)"
+  hdr="$(\mktemp)"
+  out="$(\mktemp)"
+  local -a args=( -q -LSs --max-time 60 -X "${method}" -D "${hdr}" -o "${out}" -w '%{http_code}' -H "Authorization: Bearer ${token}" )
+  [[ -n "${body}" ]] && args+=( -H "Content-Type: application/json" -d "${body}" )
+  code="$(\curl "${args[@]}" "http://172.17.0.1:${FREEIPA_KEYCLOAK_PORT}${path}")" || code="000"
+  KC_BODY="$(<"${out}")"
+  KC_LOCATION="$(\grep -i -- '^location:' "${hdr}" | \tail -n1 | \tr -d '\r\n' || true)"
+  \rm -f "${hdr}" "${out}"
+  if [[ ! "${code}" =~ ^2[0-9][0-9]$ ]]; then
+    __error "Keycloak ${method} ${path} failed (HTTP ${code}): ${KC_BODY:0:300}"
+  fi
+}
+
+# Run an `ipa service-add`, tolerating only "already exists".
+__ipa_service_add() {
+  local out
+  if ! out="$(\ipa service-add "$1" 2>&1)"; then
+    if ! \grep -qi -- 'already exists' <<< "${out}"; then
+      __error "ipa service-add $1 failed: ${out}"
+    fi
+  fi
+}
+
 # ─── Keycloak REST API configuration ─────────────────────────────────────────
 
 __configure_keycloak() {
@@ -1474,13 +1521,8 @@ __configure_keycloak() {
     2>/dev/null | \jq -r '.realm // empty' 2>/dev/null)"
 
   if [[ -z "${realm_exists}" ]]; then
-    token="$(__keycloak_admin_token)"
-    \curl -q -LSs --max-time 10 -X POST \
-      "${kc_url}/admin/realms" \
-      -H "Authorization: Bearer ${token}" \
-      -H "Content-Type: application/json" \
-      -d "$(\jq -n --arg r "${FREEIPA_KEYCLOAK_REALM}" --arg d "${FREEIPA_DOMAIN}" \
-        '{realm: $r, enabled: true, displayName: ("SSO — " + $d), sslRequired: "external", registrationAllowed: false, bruteForceProtected: true}')"
+    __kc_call POST "/admin/realms" "$(\jq -n --arg r "${FREEIPA_KEYCLOAK_REALM}" --arg d "${FREEIPA_DOMAIN}" \
+      '{realm: $r, enabled: true, displayName: ("SSO — " + $d), sslRequired: "external", registrationAllowed: false, bruteForceProtected: true}')"
     __log "Realm ${FREEIPA_KEYCLOAK_REALM} created"
   else
     __log "Realm ${FREEIPA_KEYCLOAK_REALM} already exists; skipping creation"
@@ -1552,32 +1594,21 @@ __configure_keycloak() {
     # Update in place so config drift (e.g. a fixed bind password, a corrected
     # userObjectClasses filter after a script upgrade) is reconciled on every
     # re-run instead of being permanently frozen at whatever was first created.
-    \curl -q -LSs --max-time 10 -X PUT \
-      "${kc_url}/admin/realms/${FREEIPA_KEYCLOAK_REALM}/components/${component_id}" \
-      -H "Authorization: Bearer ${token}" \
-      -H "Content-Type: application/json" \
-      -d "$(printf '%s\n' "${ldap_body}" | \jq --arg id "${component_id}" '. + {id: $id}')" \
-      >/dev/null 2>/dev/null || true
+    __kc_call PUT "/admin/realms/${FREEIPA_KEYCLOAK_REALM}/components/${component_id}" \
+      "$(printf '%s\n' "${ldap_body}" | \jq --arg id "${component_id}" '. + {id: $id}')"
     __log "LDAP federation component already exists (id: ${component_id}); config updated"
   else
-    ldap_response="$(\curl -q -LSs --max-time 10 -X POST -D - \
-      "${kc_url}/admin/realms/${FREEIPA_KEYCLOAK_REALM}/components" \
-      -H "Authorization: Bearer ${token}" \
-      -H "Content-Type: application/json" \
-      -d "${ldap_body}")"
-    component_id="$(\grep -i -- "^[Ll]ocation:" <<< "${ldap_response}" | \sed 's|.*/||' | \tr -d '\r\n')"
+    __kc_call POST "/admin/realms/${FREEIPA_KEYCLOAK_REALM}/components" "${ldap_body}"
+    component_id="${KC_LOCATION##*/}"
     __log "LDAP federation component created (id: ${component_id})"
   fi
 
   if [[ -z "${component_id}" ]]; then
-    __warn "Could not get LDAP federation component ID; skipping sync and role setup"
-    return 0
+    __error "Could not get the LDAP federation component ID from Keycloak"
   fi
 
   # Step 3 — Trigger full LDAP sync
-  \curl -q -LSs --max-time 30 -X POST \
-    "${kc_url}/admin/realms/${FREEIPA_KEYCLOAK_REALM}/user-storage/${component_id}/sync?action=triggerFullSync" \
-    -H "Authorization: Bearer ${token}" >/dev/null 2>/dev/null || true
+  __kc_call POST "/admin/realms/${FREEIPA_KEYCLOAK_REALM}/user-storage/${component_id}/sync?action=triggerFullSync"
 
   __log "LDAP full sync triggered"
 
@@ -1589,7 +1620,7 @@ __configure_keycloak() {
     sleep 5
     # Refresh token every 3 attempts to avoid 401
     if [[ $(( attempt % 3 )) -eq 0 ]]; then
-      token="$(__keycloak_admin_token)" || true
+      token="$(__keycloak_admin_token)"
     fi
     local _users_resp
     _users_resp="$(\curl -q -LSs --max-time 10 \
@@ -1600,14 +1631,13 @@ __configure_keycloak() {
   done
 
   if [[ -z "${admin_user_id}" || "${admin_user_id}" == "null" ]]; then
-    __warn "Could not find admin user in Keycloak after LDAP sync — realm-admin role not assigned"
-    return 0
+    __error "Admin user did not appear in Keycloak after the LDAP sync"
   fi
 
   # Step 5 — Assign realm-admin role to admin user
 
   # Refresh token before role assignment
-  token="$(__keycloak_admin_token)" || true
+  token="$(__keycloak_admin_token)"
 
   # Get realm-management client ID
   local rm_client_id _clients_resp
@@ -1617,8 +1647,7 @@ __configure_keycloak() {
   rm_client_id="$(printf '%s\n' "${_clients_resp}" | \jq -r 'if type == "array" then .[0].id // empty else empty end' 2>/dev/null || true)"
 
   if [[ -z "${rm_client_id}" || "${rm_client_id}" == "null" ]]; then
-    __warn "Could not find realm-management client — skipping realm-admin role assignment"
-    return 0
+    __error "Could not find the realm-management client in Keycloak"
   fi
 
   # Get realm-admin role details
@@ -1630,16 +1659,16 @@ __configure_keycloak() {
   role_name="$(printf '%s\n' "${role_info}" | \jq -r '.name // empty' 2>/dev/null || true)"
 
   if [[ -z "${role_id}" || "${role_id}" == "null" ]]; then
-    __warn "Could not find realm-admin role — skipping role assignment"
-    return 0
+    __error "Could not find the realm-admin role in Keycloak"
   fi
 
   # Assign realm-admin role to the admin user
-  \curl -q -LSs --max-time 10 -X POST \
-    "${kc_url}/admin/realms/${FREEIPA_KEYCLOAK_REALM}/users/${admin_user_id}/role-mappings/clients/${rm_client_id}" \
-    -H "Authorization: Bearer ${token}" \
-    -H "Content-Type: application/json" \
-    -d "[$(\jq -n --arg id "${role_id}" --arg name "${role_name}" '{id: $id, name: $name}')]" >/dev/null 2>/dev/null || true
+  __kc_call POST "/admin/realms/${FREEIPA_KEYCLOAK_REALM}/users/${admin_user_id}/role-mappings/clients/${rm_client_id}" \
+    "[$(\jq -n --arg id "${role_id}" --arg name "${role_name}" '{id: $id, name: $name}')]"
+  # Confirm the mapping really exists rather than trusting the POST alone
+  __kc_call GET "/admin/realms/${FREEIPA_KEYCLOAK_REALM}/users/${admin_user_id}/role-mappings/clients/${rm_client_id}"
+  \jq -e --arg n "${role_name}" 'map(.name) | index($n)' <<< "${KC_BODY}" >/dev/null \
+    || __error "realm-admin role is not mapped to the Keycloak admin user"
 
   __log "Keycloak realm configured. Admin promoted to realm-admin."
 }
@@ -1696,21 +1725,19 @@ __configure_keycloak_mail_client() {
     }')"
 
   if [[ -n "${existing_client_id}" && "${existing_client_id}" != "null" ]]; then
-    \curl -q -LSs --max-time 10 -X PUT \
-      "${kc_url}/admin/realms/${FREEIPA_KEYCLOAK_REALM}/clients/${existing_client_id}" \
-      -H "Authorization: Bearer ${token}" \
-      -H "Content-Type: application/json" \
-      -d "$(printf '%s\n' "${client_body}" | \jq --arg id "${existing_client_id}" '. + {id: $id}')" \
-      >/dev/null 2>/dev/null || true
+    __kc_call PUT "/admin/realms/${FREEIPA_KEYCLOAK_REALM}/clients/${existing_client_id}" \
+      "$(printf '%s\n' "${client_body}" | \jq --arg id "${existing_client_id}" '. + {id: $id}')"
     __log "Keycloak mail client ${FREEIPA_MAIL_KEYCLOAK_CLIENT_ID} already exists; config updated"
   else
-    \curl -q -LSs --max-time 10 -X POST \
-      "${kc_url}/admin/realms/${FREEIPA_KEYCLOAK_REALM}/clients" \
-      -H "Authorization: Bearer ${token}" \
-      -H "Content-Type: application/json" \
-      -d "${client_body}" >/dev/null 2>/dev/null || true
+    __kc_call POST "/admin/realms/${FREEIPA_KEYCLOAK_REALM}/clients" "${client_body}"
     __log "Keycloak mail client ${FREEIPA_MAIL_KEYCLOAK_CLIENT_ID} created"
   fi
+
+  # Read the client back and confirm what Dovecot depends on is really there
+  __kc_call GET "/admin/realms/${FREEIPA_KEYCLOAK_REALM}/clients?clientId=${FREEIPA_MAIL_KEYCLOAK_CLIENT_ID}"
+  \jq -e '.[0] | .enabled and .directAccessGrantsEnabled and (.protocolMappers | map(.name) | index("dovecot-audience"))' \
+    <<< "${KC_BODY}" >/dev/null \
+    || __error "Keycloak client ${FREEIPA_MAIL_KEYCLOAK_CLIENT_ID} is missing its audience mapper or direct grants"
 
   __log "Keycloak mail client configured"
 }
@@ -1923,7 +1950,7 @@ __setup_freeipa_for_mail() {
       printf 'changetype: modify\n'
       printf 'replace: userPassword\n'
       printf 'userPassword: {CLEAR}%s\n' "${INSTALL_MAIL_LDAP_PASSWORD}"
-    } | \ldapmodify -Y GSSAPI -H "ldap://${FREEIPA_FQDN}" || true
+    } | \ldapmodify -Y GSSAPI -H "ldap://${FREEIPA_FQDN}"
   fi
 
   # Remove LDIF immediately — it contained a cleartext password
@@ -1931,8 +1958,8 @@ __setup_freeipa_for_mail() {
   INSTALL_LDIF_TMP=""
 
   # Service principals backing the shared Postfix/Dovecot TLS certificate
-  \ipa service-add "smtp/${FREEIPA_FQDN}" 2>/dev/null || true
-  \ipa service-add "imap/${FREEIPA_FQDN}" 2>/dev/null || true
+  __ipa_service_add "smtp/${FREEIPA_FQDN}"
+  __ipa_service_add "imap/${FREEIPA_FQDN}"
 
   \kdestroy 2>/dev/null || true
 
