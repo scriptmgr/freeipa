@@ -726,37 +726,65 @@ __configure_ntp_settings() {
 # ─── Let's Encrypt renewal hook ──────────────────────────────────────────────
 
 __configure_letsencrypt_renewal() {
-  __log "Configuring Let's Encrypt certificate renewal hook..."
+  __log "Installing Let's Encrypt certificate for HTTPS/LDAPS/mail and renewal hook..."
 
   local renewal_hook_dir="/etc/letsencrypt/renewal-hooks/deploy"
+  local hook="${renewal_hook_dir}/freeipa-renew.sh"
   \mkdir -p "${renewal_hook_dir}"
 
-  \cat > "${renewal_hook_dir}/freeipa-renew.sh" << 'EOF'
-#!/usr/bin/env sh
-# FreeIPA certificate renewal hook for Let's Encrypt
-# Triggered automatically by certbot after successful renewal.
+  # FreeIPA keeps its own CA (Kerberos, PKINIT, host and service certificates
+  # stay IPA-issued). The public certificate is installed only on the endpoints
+  # that face public clients: the web UI/API (HTTPS), the directory server
+  # (LDAPS) and, when present, Postfix/Dovecot. The hook is both the renewal
+  # hook and the one-time installer, so there is a single code path.
+  {
+    printf '#!/usr/bin/env sh\n'
+    printf 'CRED_FILE=%q\n' "${FREEIPA_CRED_FILE}"
+    \cat << 'HOOKEOF'
+# FreeIPA public certificate hook for Let's Encrypt (managed by install.sh)
+# Run by certbot after a successful renewal, and once by install.sh.
 
-CERT_PATH="${RENEWED_LINEAGE}/fullchain.pem"
-KEY_PATH="${RENEWED_LINEAGE}/privkey.pem"
+LINEAGE="${RENEWED_LINEAGE:?RENEWED_LINEAGE not set}"
+CERT_PATH="${LINEAGE}/fullchain.pem"
+KEY_PATH="${LINEAGE}/privkey.pem"
+CHAIN_PATH="${LINEAGE}/chain.pem"
 
-if [ -f "${CERT_PATH}" ] && [ -f "${KEY_PATH}" ]; then
-  ipactl stop
-  cp "${CERT_PATH}" /etc/httpd/alias/server.crt
-  cp "${KEY_PATH}" /etc/httpd/alias/server.key
-  ipactl start
-  if [ -d /etc/mail/certs ]; then
-    cp "${CERT_PATH}" /etc/mail/certs/mail.pem
-    cp "${KEY_PATH}" /etc/mail/certs/mail.key
-    chown root:postfix /etc/mail/certs/mail.key
-    chmod 640 /etc/mail/certs/mail.key
-    systemctl reload postfix dovecot 2>/dev/null || true
-  fi
-  logger -t letsencrypt "FreeIPA certificates renewed for ${RENEWED_DOMAINS}"
+[ -f "${CERT_PATH}" ] && [ -f "${KEY_PATH}" ] || exit 0
+
+cred() { sed -n "s/^$1=//p" "${CRED_FILE}" | tail -n1; }
+DM_PASS="$(cred INSTALL_DM_PASSWORD)"
+ADMIN_PASS="$(cred INSTALL_ADMIN_PASSWORD)"
+rc=0
+
+# Make IPA trust the issuing chain so ipa-server-certinstall can validate it
+# and IPA clients/Keycloak/Dovecot verify LDAPS against /etc/ipa/ca.crt.
+if [ -f "${CHAIN_PATH}" ] && printf '%s\n' "${ADMIN_PASS}" | kinit admin >/dev/null 2>&1; then
+  ipa-cacert-manage install -t C,, "${CHAIN_PATH}" >/dev/null 2>&1 || true
+  ipa-certupdate >/dev/null 2>&1 || true
+  kdestroy >/dev/null 2>&1 || true
 fi
-EOF
 
-  \chmod +x "${renewal_hook_dir}/freeipa-renew.sh"
-  __log "Renewal hook created: ${renewal_hook_dir}/freeipa-renew.sh"
+ipa-server-certinstall -d --pin= -p "${DM_PASS}" "${KEY_PATH}" "${CERT_PATH}" || rc=1
+ipa-server-certinstall -w --pin= -p "${DM_PASS}" "${KEY_PATH}" "${CERT_PATH}" || rc=1
+
+if [ -d /etc/mail/certs ]; then
+  cp "${CERT_PATH}" /etc/mail/certs/mail.pem
+  cp "${KEY_PATH}" /etc/mail/certs/mail.key
+  chown root:postfix /etc/mail/certs/mail.key
+  chmod 640 /etc/mail/certs/mail.key
+  systemctl reload postfix dovecot 2>/dev/null || true
+fi
+
+logger -t letsencrypt "FreeIPA public certificate installed from ${LINEAGE} (rc=${rc})"
+exit "${rc}"
+HOOKEOF
+  } > "${hook}"
+  \chmod +x "${hook}"
+  __log "Renewal hook created: ${hook}"
+
+  if ! RENEWED_LINEAGE="${INSTALL_FULLCHAIN_PATH%/*}" "${hook}"; then
+    __warn "Could not install the Let's Encrypt certificate on HTTPS/LDAPS; FreeIPA keeps its IPA-issued certificate"
+  fi
 }
 
 # - - - - - - - - - - - - - - - - - - - - - - - - -
@@ -823,27 +851,6 @@ __install_freeipa() {
     else
       install_cmd+=( --no-reverse )
     fi
-  fi
-
-  if [[ "${INSTALL_USE_LETSENCRYPT}" == "true" ]]; then
-    __log "Using Let's Encrypt certificates"
-    # ipa-server-install has no *-key-file options: --http-cert-file and
-    # --dirsrv-cert-file each take the certificate and the private key as
-    # separate files, so each option is passed twice. The key is unencrypted
-    # (certbot privkey.pem) but unattended mode still demands a PIN option per
-    # cert, so an empty PIN is passed. ipa-server-install requires the dirsrv,
-    # http and pkinit certs together: a public CA issues no PKINIT certificate,
-    # so PKINIT is disabled, and --ca-cert-file lets it validate the chain.
-    install_cmd+=(
-      --no-pkinit
-      "--dirsrv-pin="
-      "--http-pin="
-      "--ca-cert-file=${INSTALL_CHAIN_PATH}"
-      "--http-cert-file=${INSTALL_FULLCHAIN_PATH}"
-      "--http-cert-file=${INSTALL_KEY_PATH}"
-      "--dirsrv-cert-file=${INSTALL_FULLCHAIN_PATH}"
-      "--dirsrv-cert-file=${INSTALL_KEY_PATH}"
-    )
   fi
 
   __log "Running FreeIPA installation (may take 10–20 minutes)..."
@@ -1944,9 +1951,9 @@ __setup_freeipa_for_mail() {
   INSTALL_MAIL_KEY_PATH="/etc/mail/certs/mail.key"
 
   if [[ "${INSTALL_USE_LETSENCRYPT}" == "true" ]]; then
-    # Externally supplied service certs make ipa-server-install CA-less ("CA is
-    # not configured"), so IPA cannot issue the mail certificate. Reuse the
-    # Let's Encrypt certificate; the renewal hook refreshes this copy.
+    # Mail faces public clients, so it uses the publicly trusted Let's Encrypt
+    # certificate instead of an IPA-issued one; the renewal hook refreshes
+    # this copy and reloads both daemons.
     \cp "${INSTALL_FULLCHAIN_PATH}" "${INSTALL_MAIL_CERT_PATH}"
     \cp "${INSTALL_KEY_PATH}" "${INSTALL_MAIL_KEY_PATH}"
     \restorecon -F "${INSTALL_MAIL_CERT_PATH}" "${INSTALL_MAIL_KEY_PATH}" 2>/dev/null || true

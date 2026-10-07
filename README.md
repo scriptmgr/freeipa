@@ -29,7 +29,7 @@ bash install.sh
 2. **Checks requirements** — 2 GB+ RAM (4 GB+ recommended), 10 GB+ free disk, valid FQDN
 3. **Installs prerequisites** — Docker CE and `jq`, skipped if already present
 4. **Configures `/etc/hosts`, NTP/Chrony, and DNS forwarders** automatically
-5. **Selects SSL certificates** — reuses an existing Let's Encrypt certificate if found, otherwise falls back to FreeIPA's built-in CA. With a Let's Encrypt certificate FreeIPA is installed without its own CA and with PKINIT disabled (FreeIPA requires all service certificates to be supplied together), and Postfix/Dovecot reuse that same certificate, refreshed by the certbot renewal hook
+5. **Selects SSL certificates** — reuses an existing Let's Encrypt certificate if found, otherwise falls back to FreeIPA's built-in CA. FreeIPA is always installed with its own CA (Kerberos, PKINIT and host certificates stay IPA-issued); a Let's Encrypt certificate is installed afterwards only on the public-facing TLS endpoints — the web UI/API (HTTPS), the directory server (LDAPS) and Postfix/Dovecot — and renewals are re-applied by a certbot deploy hook
 6. **Installs and configures FreeIPA** (`ipa-server-install --unattended`), generating and saving the admin and Directory Manager passwords
 7. **Configures Apache for reverse-proxy use** on a random high port so an external reverse proxy can front FreeIPA
 8. **Federates Keycloak against FreeIPA LDAP** — creates a `keycloak` LDAP bind account, an `HTTP` Kerberos service principal, and exports a keytab plus the IPA CA certificate
