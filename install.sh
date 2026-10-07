@@ -744,6 +744,13 @@ if [ -f "${CERT_PATH}" ] && [ -f "${KEY_PATH}" ]; then
   cp "${CERT_PATH}" /etc/httpd/alias/server.crt
   cp "${KEY_PATH}" /etc/httpd/alias/server.key
   ipactl start
+  if [ -d /etc/mail/certs ]; then
+    cp "${CERT_PATH}" /etc/mail/certs/mail.pem
+    cp "${KEY_PATH}" /etc/mail/certs/mail.key
+    chown root:postfix /etc/mail/certs/mail.key
+    chmod 640 /etc/mail/certs/mail.key
+    systemctl reload postfix dovecot 2>/dev/null || true
+  fi
   logger -t letsencrypt "FreeIPA certificates renewed for ${RENEWED_DOMAINS}"
 fi
 EOF
@@ -823,8 +830,15 @@ __install_freeipa() {
     # ipa-server-install has no *-key-file options: --http-cert-file and
     # --dirsrv-cert-file each take the certificate and the private key as
     # separate files, so each option is passed twice. The key is unencrypted
-    # (certbot privkey.pem), so no --*-pin is needed.
+    # (certbot privkey.pem) but unattended mode still demands a PIN option per
+    # cert, so an empty PIN is passed. ipa-server-install requires the dirsrv,
+    # http and pkinit certs together: a public CA issues no PKINIT certificate,
+    # so PKINIT is disabled, and --ca-cert-file lets it validate the chain.
     install_cmd+=(
+      --no-pkinit
+      "--dirsrv-pin="
+      "--http-pin="
+      "--ca-cert-file=${INSTALL_CHAIN_PATH}"
       "--http-cert-file=${INSTALL_FULLCHAIN_PATH}"
       "--http-cert-file=${INSTALL_KEY_PATH}"
       "--dirsrv-cert-file=${INSTALL_FULLCHAIN_PATH}"
@@ -1929,35 +1943,45 @@ __setup_freeipa_for_mail() {
   INSTALL_MAIL_CERT_PATH="/etc/mail/certs/mail.pem"
   INSTALL_MAIL_KEY_PATH="/etc/mail/certs/mail.key"
 
-  # Request (or reuse) a single IPA-issued certificate shared by Postfix and
-  # Dovecot — tracked and auto-renewed by certmonger. The request itself runs
-  # under the host's own credentials (no admin kinit needed for this part).
-  # -B/-C keep the key group-readable by postfix and reload both daemons
-  # across every certmonger-driven renewal, not just the initial issuance.
-  if ! \getcert list -f "${INSTALL_MAIL_CERT_PATH}" >/dev/null 2>&1; then
-    \ipa-getcert request \
-      -f "${INSTALL_MAIL_CERT_PATH}" \
-      -k "${INSTALL_MAIL_KEY_PATH}" \
-      -N "CN=${FREEIPA_FQDN}" \
-      -K "smtp/${FREEIPA_FQDN}" \
-      -D "${FREEIPA_FQDN}" \
-      -B "chown root:postfix ${INSTALL_MAIL_KEY_PATH}; chmod 640 ${INSTALL_MAIL_KEY_PATH}" \
-      -C "systemctl reload postfix dovecot 2>/dev/null || true" \
-      -w
-  fi
-
-  # Wait for certmonger to finish issuing the certificate (local CA — fast)
-  local elapsed=0
-  while [[ "${elapsed}" -lt 60 ]]; do
-    if \getcert list -f "${INSTALL_MAIL_CERT_PATH}" 2>/dev/null | \grep -q -- 'status: MONITORING'; then
-      break
+  if [[ "${INSTALL_USE_LETSENCRYPT}" == "true" ]]; then
+    # Externally supplied service certs make ipa-server-install CA-less ("CA is
+    # not configured"), so IPA cannot issue the mail certificate. Reuse the
+    # Let's Encrypt certificate; the renewal hook refreshes this copy.
+    \cp "${INSTALL_FULLCHAIN_PATH}" "${INSTALL_MAIL_CERT_PATH}"
+    \cp "${INSTALL_KEY_PATH}" "${INSTALL_MAIL_KEY_PATH}"
+    \restorecon -F "${INSTALL_MAIL_CERT_PATH}" "${INSTALL_MAIL_KEY_PATH}" 2>/dev/null || true
+  else
+    # Request (or reuse) a single IPA-issued certificate shared by Postfix and
+    # Dovecot — tracked and auto-renewed by certmonger. The request itself runs
+    # under the host's own credentials (no admin kinit needed for this part).
+    # -B/-C keep the key group-readable by postfix and reload both daemons
+    # across every certmonger-driven renewal, not just the initial issuance.
+    if ! \getcert list -f "${INSTALL_MAIL_CERT_PATH}" >/dev/null 2>&1; then
+      \ipa-getcert request \
+        -f "${INSTALL_MAIL_CERT_PATH}" \
+        -k "${INSTALL_MAIL_KEY_PATH}" \
+        -N "CN=${FREEIPA_FQDN}" \
+        -K "smtp/${FREEIPA_FQDN}" \
+        -D "${FREEIPA_FQDN}" \
+        -B "chown root:postfix ${INSTALL_MAIL_KEY_PATH}; chmod 640 ${INSTALL_MAIL_KEY_PATH}" \
+        -C "systemctl reload postfix dovecot 2>/dev/null || true" \
+        -w
     fi
-    sleep 2
-    elapsed=$(( elapsed + 2 ))
-  done
-  if ! \getcert list -f "${INSTALL_MAIL_CERT_PATH}" 2>/dev/null | \grep -q -- 'status: MONITORING'; then
-    __error "Mail TLS certificate was not issued within 60 seconds (exit 70)"
-    exit 70
+
+    # Wait for certmonger to finish issuing the certificate (local CA — fast)
+    local elapsed=0
+    while [[ "${elapsed}" -lt 60 ]]; do
+      if \getcert list -f "${INSTALL_MAIL_CERT_PATH}" 2>/dev/null | \grep -q -- 'status: MONITORING'; then
+        break
+      fi
+      sleep 2
+      elapsed=$(( elapsed + 2 ))
+    done
+    if ! \getcert list -f "${INSTALL_MAIL_CERT_PATH}" 2>/dev/null | \grep -q -- 'status: MONITORING'; then
+      __error "Mail TLS certificate was not issued within 60 seconds (exit 70)"
+      exit 70
+    fi
+
   fi
 
   \chown root:postfix "${INSTALL_MAIL_KEY_PATH}"
@@ -2372,7 +2396,11 @@ __display_summary() {
     printf '  Auth (Keycloak):  OAUTHBEARER/XOAUTH2 via token introspection (IMAP/POP3 only)\n'
   fi
   printf '  Mailbox storage:  %s/%s/<uid>\n' "${FREEIPA_MAIL_BASE_DIR}" "${FREEIPA_MAIL_DOMAIN}"
-  printf '  TLS certificate:  FreeIPA-issued, tracked by certmonger (auto-renews)\n'
+  if [[ "${INSTALL_USE_LETSENCRYPT}" == "true" ]]; then
+    printf '  TLS certificate:  Let'"'"'s Encrypt (refreshed by the certbot renewal hook)\n'
+  else
+    printf '  TLS certificate:  FreeIPA-issued, tracked by certmonger (auto-renews)\n'
+  fi
 }
 
 # - - - - - - - - - - - - - - - - - - - - - - - - -
