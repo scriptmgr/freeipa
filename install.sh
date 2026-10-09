@@ -50,7 +50,6 @@ INSTALL_DISTRO_VERSION=""
 FREEIPA_FQDN="${FREEIPA_FQDN:-}"
 FREEIPA_DOMAIN="${FREEIPA_DOMAIN:-}"
 FREEIPA_REALM="${FREEIPA_REALM:-}"
-FREEIPA_PORT="${FREEIPA_PORT:-}"
 FREEIPA_CRED_FILE="${FREEIPA_CRED_FILE:-/etc/ipa/creds.conf}"
 INSTALL_LEGACY_CRED_FILE="/root/.freeipa-install.conf"
 INSTALL_DNS="false"
@@ -185,24 +184,15 @@ __migrate_legacy_credential_file() {
   __log "Migrated credentials from ${INSTALL_LEGACY_CRED_FILE} to ${new_file}"
 }
 
-# Older install.sh releases persisted the port credentials under their old
-# INSTALL_* key names. On upgrade, the renamed FREEIPA_* keys used below would
-# be absent from an existing credentials file, causing this script to
-# generate and save a brand-new random port that doesn't match the port the
-# already-deployed Keycloak container is actually bound to. Rename the
-# legacy keys in place, once, so an upgraded script keeps reading the same
-# port a previous run already committed to.
+# Older install.sh releases persisted the Keycloak port under its old key.
+# Rename it in place so an upgraded script keeps the port the container uses.
 __migrate_legacy_credential_keys() {
   local file="${1:?Usage: __migrate_legacy_credential_keys <file>}"
   [[ -f "${file}" ]] || return 0
-  local old new
-  for pair in "INSTALL_FREEIPA_PORT:FREEIPA_PORT" "INSTALL_KEYCLOAK_PORT:FREEIPA_KEYCLOAK_PORT"; do
-    old="${pair%%:*}"
-    new="${pair##*:}"
-    if \grep -q -- "^${old}=" "${file}" && ! \grep -q -- "^${new}=" "${file}"; then
-      \sed -i "s/^${old}=/${new}=/" "${file}"
-    fi
-  done
+  if \grep -q -- '^INSTALL_KEYCLOAK_PORT=' "${file}" && ! \grep -q -- '^FREEIPA_KEYCLOAK_PORT=' "${file}"; then
+    \sed -i 's/^INSTALL_KEYCLOAK_PORT=/FREEIPA_KEYCLOAK_PORT=/' "${file}"
+  fi
+  \sed -i '/^\(INSTALL_\)\?FREEIPA_PORT=/d' "${file}"
 }
 
 __determine_domain_name() {
@@ -274,7 +264,6 @@ __help() {
   printf '  FREEIPA_FQDN             Override auto-detected hostname\n'
   printf '  FREEIPA_DOMAIN           Override auto-detected domain\n'
   printf '  FREEIPA_REALM            Override auto-detected Kerberos realm\n'
-  printf '  FREEIPA_PORT             Reverse-proxy HTTPS port (default: random in 62000-64999)\n'
   printf '  FREEIPA_CRED_FILE        Credentials file path (default: /etc/ipa/creds.conf)\n'
   printf '  FREEIPA_DEBUG            Enable debug output when set to 1 (same as --debug)\n'
   printf '  FREEIPA_KEYCLOAK_PORT    Override Keycloak port (default: random in 62000-64999)\n'
@@ -290,11 +279,8 @@ __help() {
   printf '  FREEIPA_MAIL_KEYCLOAK_CLIENT_ID  Keycloak client ID for token introspection (default: dovecot-mail)\n'
   printf '  NO_COLOR                 Disable color output when set\n\n'
   printf 'Notes:\n'
-  printf '  FREEIPA_PORT and FREEIPA_KEYCLOAK_PORT take precedence over the port\n'
-  printf '  recorded in FREEIPA_CRED_FILE, so a port can be pinned without editing\n'
-  printf '  the credentials file. FREEIPA_PORT is labelled http_port_t for httpd\n'
-  printf '  when semanage is available (an SELinux-enforcing host otherwise blocks\n'
-  printf '  the bind on a custom high port).\n'
+  printf '  FreeIPA uses Apache on ports 80 and 443; HTTP requests redirect to HTTPS.\n'
+  printf '  An installed nginx service is stopped, disabled, and masked.\n'
 }
 
 __version() {
@@ -557,6 +543,8 @@ __check_letsencrypt_certs() {
     [[ -d "${cert_dir}" ]] || continue
     [[ -f "${cert_dir}/cert.pem" ]] || continue
     [[ -f "${cert_dir}/privkey.pem" ]] || continue
+    [[ -f "${cert_dir}/fullchain.pem" ]] || continue
+    \openssl x509 -in "${cert_dir}/cert.pem" -noout -checkhost "${FREEIPA_FQDN}" >/dev/null 2>&1 || continue
     cert_name="${cert_dir##*/}"
     # Skip the README file that certbot places in the directory
     [[ "${cert_name}" == "README" ]] && continue
@@ -658,6 +646,19 @@ __configure_ssl_certs() {
 __configure_dns_settings() {
   __log "Auto-detecting DNS configuration..."
 
+  # On an idempotent rerun, the installed IPA DNS service already resolves the
+  # hostname. Preserve the existing integrated-DNS state instead of treating
+  # that successful lookup as evidence that IPA DNS is not in use.
+  if [[ -f "/etc/ipa/default.conf" && -f "/etc/named/ipa-ext.conf" ]]; then
+    INSTALL_DNS="true"
+    INSTALL_CONFIGURE_REVERSE_ZONE="false"
+    INSTALL_USE_AUTO_FORWARDERS="false"
+    INSTALL_DNS_FORWARDERS=""
+    __log "Integrated DNS is already installed; preserving existing configuration"
+    __log "DNS configuration: integrated DNS=Yes"
+    return 0
+  fi
+
   if ! \nslookup "${FREEIPA_FQDN}" >/dev/null 2>&1; then
     __log "Hostname not resolvable via DNS; will install integrated DNS server"
     INSTALL_DNS="true"
@@ -726,17 +727,15 @@ __configure_ntp_settings() {
 # ─── Let's Encrypt renewal hook ──────────────────────────────────────────────
 
 __configure_letsencrypt_renewal() {
-  __log "Installing Let's Encrypt certificate for HTTPS/LDAPS/mail and renewal hook..."
+  __log "Installing Let's Encrypt certificate for FreeIPA HTTPS only and creating renewal hook..."
 
   local renewal_hook_dir="/etc/letsencrypt/renewal-hooks/deploy"
   local hook="${renewal_hook_dir}/freeipa-renew.sh"
   \mkdir -p "${renewal_hook_dir}"
 
-  # FreeIPA keeps its own CA (Kerberos, PKINIT, host and service certificates
-  # stay IPA-issued). The public certificate is installed only on the endpoints
-  # that face public clients: the web UI/API (HTTPS), the directory server
-  # (LDAPS) and, when present, Postfix/Dovecot. The hook is both the renewal
-  # hook and the one-time installer, so there is a single code path.
+  # The Let's Encrypt leaf certificate is installed only for Apache HTTPS.
+  # FreeIPA keeps IPA-issued certificates for LDAP, Kerberos, PKINIT, and mail.
+  # The issuer chain is added to IPA trust so Apache can validate the HTTPS cert.
   {
     printf '#!/usr/bin/env sh\n'
     printf 'CRED_FILE=%q\n' "${FREEIPA_CRED_FILE}"
@@ -771,18 +770,13 @@ if [ -f "${CHAIN_PATH}" ]; then
   fi
 fi
 
-ipa-server-certinstall -d --pin= -p "${DM_PASS}" "${KEY_PATH}" "${CERT_PATH}" || rc=1
-ipa-server-certinstall -w --pin= -p "${DM_PASS}" "${KEY_PATH}" "${CERT_PATH}" || rc=1
-
-if [ -d /etc/mail/certs ]; then
-  cp "${CERT_PATH}" /etc/mail/certs/mail.pem
-  cp "${KEY_PATH}" /etc/mail/certs/mail.key
-  chown root:postfix /etc/mail/certs/mail.key
-  chmod 640 /etc/mail/certs/mail.key
-  systemctl reload postfix dovecot 2>/dev/null || true
+if ipa-server-certinstall -w --pin= -p "${DM_PASS}" "${KEY_PATH}" "${CERT_PATH}"; then
+  systemctl restart httpd || rc=1
+else
+  rc=1
 fi
 
-logger -t letsencrypt "FreeIPA public certificate installed from ${LINEAGE} (rc=${rc})"
+logger -t letsencrypt "FreeIPA HTTPS certificate installed from ${LINEAGE} (rc=${rc})"
 exit "${rc}"
 HOOKEOF
   } > "${hook}"
@@ -790,7 +784,7 @@ HOOKEOF
   __log "Renewal hook created: ${hook}"
 
   if ! RENEWED_LINEAGE="${INSTALL_FULLCHAIN_PATH%/*}" "${hook}"; then
-    __error "Could not install the Let's Encrypt certificate on HTTPS/LDAPS (exit 71)"
+    __error "Could not install the Let's Encrypt certificate on FreeIPA HTTPS (exit 71)"
   fi
 }
 
@@ -809,6 +803,9 @@ __install_freeipa() {
     INSTALL_DM_PASSWORD="$(__load_credential "${FREEIPA_CRED_FILE}" INSTALL_DM_PASSWORD)" || {
       __warn "FreeIPA installed but DM password not found in ${FREEIPA_CRED_FILE}"
     }
+    if [[ "${INSTALL_USE_LETSENCRYPT}" == "true" ]]; then
+      __configure_letsencrypt_renewal
+    fi
     return 0
   fi
 
@@ -873,97 +870,131 @@ __install_freeipa() {
 
 # - - - - - - - - - - - - - - - - - - - - - - - - -
 
-# ─── Reverse proxy Apache configuration ──────────────────────────────────────
+# ─── Apache port normalization ───────────────────────────────────────────────
 
+# Some hosts run Apache on 81/8443 behind an nginx that owns 80/443. FreeIPA
+# needs 80/443 for its own Apache, and its CA (Dogtag) binds 8443 itself, so a
+# stock Apache listener on 8443 keeps the CA from starting. Move Listen 81 back
+# to 80, drop Listen 8443 (mod_ssl's ssl.conf supplies 443) and disable the
+# virtual hosts that were bound to 81/8443: left
+# on 80/443 they would sit in front of FreeIPA's own vhost (a catch-all vhost
+# with its own certificate serves that certificate to FreeIPA itself and breaks
+# its client-side verification). Keep a backup of every file touched and prove
+# the configuration still parses instead of trusting the edit.
 __fix_httpd_ports() {
-  local check_ports f 
-  check_ports="$(grep -sR 8443 "/etc/httpd/conf"|awk -F: '{print $1}')"
-  if [ -n "$check_ports" ]; then 
-    for f in $check_ports; do
-      sed -i 's|:81>|:80>|g' "$f" 
-      sed -i 's|:8443>|:443>|g' "$f" 
+  local re='^[[:space:]]*Listen[[:space:]]+([^#[:space:]]*:)?(81|8443)([[:space:]]|$)|^[[:space:]]*<VirtualHost[^>]*:(81|8443)>'
+  [[ -d /etc/httpd ]] || return 0
+  # An installed FreeIPA already owns these ports (its CA holds 8443); nothing to do
+  [[ -f /etc/ipa/default.conf ]] && return 0
+
+  local -a files=()
+  local f
+  while IFS= read -r f; do
+    files+=("${f}")
+  done < <(\grep -rlisE --include='*.conf' -- "${re}" /etc/httpd || true)
+
+  local rc_before=0 out=""
+  if [[ "${#files[@]}" -eq 0 ]]; then
+    __log "Apache configuration has no 81/8443 listeners; nothing to rewrite"
+  else
+    if \command -v httpd >/dev/null 2>&1; then
+      \httpd -t >/dev/null 2>&1 || rc_before=1
+    fi
+    __rewrite_httpd_ports "${re}" "${rc_before}" "${files[@]}"
   fi
+
+  __ensure_stock_ssl_conf
+
+  # A running httpd keeps its old sockets until restarted. Key this on what it
+  # is actually listening on, not on whether files changed, so a re-run after a
+  # failed attempt still releases 81/8443 before ipa-server-install checks them.
+  if \ss -H -ltnp 2>/dev/null | \awk '$4 ~ /:(81|8443)$/ && /httpd/ {f=1} END{exit !f}'; then
+    __log "Restarting Apache so it releases ports 81/8443"
+    \systemctl restart httpd || __error "Could not restart Apache after moving it off 81/8443 (exit 75)"
+  fi
+
+  local port holder
+  for port in 8443 8080 8005 8009; do
+    holder="$(\ss -H -ltnp 2>/dev/null | \awk -v p=":${port}$" '$4 ~ p {print $NF; exit}')"
+    if [[ -n "${holder}" ]]; then
+      __error "Port ${port} is in use (${holder}); FreeIPA's CA needs 8005, 8009, 8080 and 8443 (exit 76)"
+    fi
+  done
 }
 
-__configure_reverse_proxy() {
-  __log "Configuring FreeIPA for reverse proxy setup..."
-
-  # Label FREEIPA_PORT for httpd before starting it. http_port_t only covers
-  # 80/81/443/488/8008/8009/8443/9000, so on an SELinux-enforcing RHEL-family
-  # host a custom high port is denied at bind time with a bare
-  # "make_sock: could not bind" / AH00072 and httpd exits status 1. Add the
-  # port to http_port_t so httpd is permitted to bind it. Use -m first so a
-  # re-run against an already-labelled port is a no-op rather than an error.
-  if \command -v semanage >/dev/null 2>&1; then
-    if \semanage port -m -t http_port_t -p tcp "${FREEIPA_PORT}" 2>/dev/null; then
-      __log "Relabelled existing SELinux port ${FREEIPA_PORT} as http_port_t"
-    elif \semanage port -a -t http_port_t -p tcp "${FREEIPA_PORT}" 2>/dev/null; then
-      __log "Labelled port ${FREEIPA_PORT} as http_port_t for httpd"
-    else
-      __warn "Could not label port ${FREEIPA_PORT} as http_port_t; httpd may fail to bind if SELinux is enforcing"
-    fi
-  fi
-
-  local apache_conf_dir=""
-  local ssl_conf="" rewrite_conf=""
-  if [[ -d "/etc/httpd/conf.d" ]]; then
-    apache_conf_dir="/etc/httpd/conf.d"
-    ssl_conf="/etc/httpd/conf.d/ssl.conf"
-    rewrite_conf="/etc/httpd/conf.d/ipa-rewrite.conf"
-  elif [[ -d "/etc/apache2/conf-available" ]]; then
-    apache_conf_dir="/etc/apache2/conf-available"
-    ssl_conf="/etc/apache2/conf-available/ssl.conf"
-    rewrite_conf="/etc/apache2/conf-available/ipa-rewrite.conf"
-  else
-    __warn "Could not find Apache configuration directory; skipping reverse proxy config"
+# FreeIPA configures TLS by editing directives inside mod_ssl's default
+# <VirtualHost _default_:443>. On a host whose ssl.conf was emptied or has no
+# vhost, those edits land outside any vhost, SSLEngine is never enabled and
+# port 443 answers plain HTTP. Restore the packaged ssl.conf in that case.
+__ensure_stock_ssl_conf() {
+  local conf="/etc/httpd/conf.d/ssl.conf" tmp pkg
+  [[ -d /etc/httpd/conf.d ]] || return 0
+  \command -v rpm >/dev/null 2>&1 || return 0
+  pkg="$(\rpm -q mod_ssl 2>/dev/null)" || return 0
+  if \grep -qiE '^[[:space:]]*<VirtualHost' "${conf}" 2>/dev/null; then
     return 0
   fi
 
-  # Step 1: Write a minimal port-only config — just adds a Listen directive.
-  # Do NOT create a duplicate VirtualHost; ipa.conf contains server-scope
-  # directives (WSGISocketPrefix etc.) that cannot live inside <VirtualHost>.
-  # The existing ssl.conf VirtualHost is extended below to also accept PORT.
-  local apache_port_conf="${apache_conf_dir}/freeipa-port.conf"
-  \cat > "${apache_port_conf}" << EOF
-# FreeIPA custom port for reverse proxy — managed by install.sh
-# Adds a second Listen so the ssl.conf VirtualHost also accepts FREEIPA_PORT.
-Listen ${FREEIPA_PORT} https
-EOF
+  \command -v rpm2cpio >/dev/null 2>&1 && \command -v cpio >/dev/null 2>&1 \
+    || __error "rpm2cpio and cpio are required to restore ${conf} (exit 77)"
+  tmp="$(\mktemp -d)"
+  ( cd "${tmp}" && \dnf download -q "${pkg}" >/dev/null 2>&1 ) \
+    || { \rm -rf "${tmp}"; __error "Could not download ${pkg} to restore ${conf} (exit 77)"; }
+  ( cd "${tmp}" && \rpm2cpio ./*.rpm | \cpio -idm ./etc/httpd/conf.d/ssl.conf >/dev/null 2>&1 )
+  if [[ ! -s "${tmp}/etc/httpd/conf.d/ssl.conf" ]]; then
+    \rm -rf "${tmp}"
+    __error "${pkg} did not provide ${conf} (exit 77)"
+  fi
+  [[ -e "${conf}.pre-freeipa" ]] || \cp -p "${conf}" "${conf}.pre-freeipa" 2>/dev/null || true
+  \cp "${tmp}/etc/httpd/conf.d/ssl.conf" "${conf}"
+  \rm -rf "${tmp}"
+  __log "Restored the packaged ${conf} (it had no virtual host; backup: ${conf}.pre-freeipa)"
+}
 
-  # Enable the configuration if using Apache2's conf-enabled mechanism
-  if [[ -d "/etc/apache2/conf-enabled" ]]; then
-    \ln -sf "${apache_port_conf}" /etc/apache2/conf-enabled/freeipa-port.conf
+# Rewrite the 81/8443 listeners in the given files; restore them if httpd -t
+# turns invalid because of the change. Args: <regex> <rc_before> <file>...
+__rewrite_httpd_ports() {
+  local re="$1" rc_before="$2"
+  shift 2
+  local -a files=("$@")
+  local f out=""
+
+  for f in "${files[@]}"; do
+    [[ -e "${f}.pre-freeipa" ]] || \cp -p "${f}" "${f}.pre-freeipa"
+    \awk '
+      BEGIN { IGNORECASE = 1 }
+      /^[[:space:]]*<VirtualHost[^>]*:(81|8443)>/ { inblock = 1 }
+      { if (inblock) { print "# freeipa-disabled: " $0 } else { print $0 } }
+      inblock && /^[[:space:]]*<\/VirtualHost>/ { inblock = 0 }
+    ' "${f}" > "${f}.freeipa-tmp" && \mv -f "${f}.freeipa-tmp" "${f}"
+    \sed -i -E \
+      -e 's/^([[:space:]]*Listen[[:space:]]+([^#[:space:]]*:)?)81([[:space:]]|$)/\180\3/I' \
+      -e 's/^([[:space:]]*Listen[[:space:]]+([^#[:space:]]*:)?8443([[:space:]]|$).*)$/# freeipa-disabled: \1/I' \
+      "${f}"
+    __log "Moved Apache Listen 81 to 80 and disabled Listen 8443 plus the 81/8443 virtual hosts in ${f} (backup: ${f}.pre-freeipa)"
+  done
+
+  if \grep -rqisE --include='*.conf' -- "${re}" /etc/httpd; then
+    __error "Apache still has a 81/8443 listener after moving ports (exit 74)"
   fi
 
-  # Step 2: Extend the existing SSL VirtualHost to also accept FREEIPA_PORT.
-  # ssl.conf has <VirtualHost _default_:443> — change it to accept both ports.
-  # This avoids duplicating any of the WSGI/SSL directives.
-  if [[ -f "${ssl_conf}" ]]; then
-    \sed -i "s|<VirtualHost _default_:443>|<VirtualHost _default_:443 _default_:${FREEIPA_PORT}>|" "${ssl_conf}"
-    \grep -q -- "_default_:${FREEIPA_PORT}>" "${ssl_conf}" \
-      || __error "ssl.conf VirtualHost does not listen on ${FREEIPA_PORT} after editing ${ssl_conf}"
-    __log "Extended ssl.conf VirtualHost to also listen on port ${FREEIPA_PORT}"
-  fi
-
-  # Step 3: Patch ipa-rewrite.conf so it does not redirect requests arriving on
-  # FREEIPA_PORT back to port 443 (which would cause infinite redirect
-  # loops when nginx proxies to our custom port).
-  if [[ -f "${rewrite_conf}" ]]; then
-    # Insert an extra RewriteCond to exclude our custom port, immediately after
-    # the existing !^443$ condition line.
-    # -F: the inserted line ends in a literal "$" (an Apache regex anchor), so a
-    # regex grep would treat it as end-of-line and never match
-    if ! \grep -qF -- "!^${FREEIPA_PORT}\$" "${rewrite_conf}" 2>/dev/null; then
-      \sed -i "/RewriteCond %{SERVER_PORT}[[:space:]]*!\^443\\\$/a RewriteCond %{SERVER_PORT}  !^${FREEIPA_PORT}$" \
-        "${rewrite_conf}"
-      \grep -qF -- "!^${FREEIPA_PORT}\$" "${rewrite_conf}" \
-        || __error "ipa-rewrite.conf was not patched for port ${FREEIPA_PORT}"
-      __log "Patched ipa-rewrite.conf to skip redirect for port ${FREEIPA_PORT}"
+  if \command -v httpd >/dev/null 2>&1; then
+    if ! out="$(\httpd -t 2>&1)"; then
+      if [[ "${rc_before}" -eq 0 ]]; then
+        for f in "${files[@]}"; do
+          \cp -p "${f}.pre-freeipa" "${f}"
+        done
+        __error "Apache configuration is invalid after moving ports to 80/443; originals restored: ${out}"
+      fi
+      __warn "Apache configuration was already invalid before the port change: ${out}"
     fi
   fi
+}
 
-  __log "Configured Apache to listen on port ${FREEIPA_PORT}"
+# ─── FreeIPA HTTP configuration verification ────────────────────────────────
 
+__configure_freeipa_http() {
+  __log "Configuring FreeIPA Apache on standard HTTP and HTTPS ports..."
   local _web_units
   _web_units="$(\systemctl list-unit-files 2>/dev/null | \awk '{print $1}' || true)"
   if printf '%s\n' "${_web_units}" | \grep -q -- "^httpd.service$"; then
@@ -971,6 +1002,53 @@ EOF
   elif printf '%s\n' "${_web_units}" | \grep -q -- "^apache2.service$"; then
     \systemctl restart apache2
   fi
+
+  __verify_freeipa_http
+}
+
+__disable_nginx_service() {
+  local unit_state="not-found"
+  if ! \command -v systemctl >/dev/null 2>&1; then
+    if \command -v nginx >/dev/null 2>&1; then
+      __error "nginx is installed but systemctl is unavailable; stop and mask nginx before installing FreeIPA"
+    fi
+    return 0
+  fi
+
+  unit_state="$(\systemctl show --property=LoadState --value nginx.service 2>/dev/null || true)"
+  if ! \command -v nginx >/dev/null 2>&1 && [[ "${unit_state}" == "not-found" || -z "${unit_state}" ]]; then
+    __log "nginx is not installed"
+    return 0
+  fi
+
+  if \systemctl is-active --quiet nginx.service; then
+    \systemctl stop nginx.service || __error "Could not stop nginx; FreeIPA requires ports 80 and 443"
+  fi
+  if [[ "${unit_state}" != "not-found" && "${unit_state}" != "masked" && -n "${unit_state}" ]]; then
+    \systemctl disable nginx.service >/dev/null 2>&1 || true
+  fi
+  \systemctl mask nginx.service >/dev/null || __error "Could not mask nginx.service"
+  __log "Disabled and masked nginx; FreeIPA Apache will own ports 80 and 443"
+}
+
+__verify_freeipa_http() {
+  local listeners port response status redirect
+  listeners="$(\ss -H -ltn 2>/dev/null || true)"
+  for port in 80 443; do
+    if ! \awk -v suffix=":${port}" '$4 ~ (suffix "$") { found = 1 } END { exit !found }' <<< "${listeners}"; then
+      __error "FreeIPA Apache is not listening on port ${port}"
+    fi
+  done
+
+  response="$(\curl --silent --show-error --insecure --max-time 15 --output /dev/null --write-out '%{http_code} %{redirect_url}' \
+    --resolve "${FREEIPA_FQDN}:80:127.0.0.1" "http://${FREEIPA_FQDN}/ipa/ui" 2>/dev/null)" \
+    || __error "Could not verify FreeIPA HTTP to HTTPS redirect"
+  status="${response%% *}"
+  redirect="${response#* }"
+  if [[ ( "${status}" != "301" && "${status}" != "302" ) || "${redirect}" != "https://${FREEIPA_FQDN}"* ]]; then
+    __error "FreeIPA HTTP endpoint did not redirect to HTTPS for ${FREEIPA_FQDN} (status ${status})"
+  fi
+  __log "Verified FreeIPA listens on ports 80 and 443 and redirects HTTP to HTTPS"
 }
 
 # - - - - - - - - - - - - - - - - - - - - - - - - -
@@ -1022,7 +1100,7 @@ __configure_apache_keycloak_proxy() {
 </IfModule>
 
 RequestHeader set X-Forwarded-Proto "https"
-RequestHeader set X-Forwarded-Port "${FREEIPA_PORT}"
+RequestHeader set X-Forwarded-Port "443"
 EOF
 
   if [[ -d "/etc/apache2/conf-enabled" ]]; then
@@ -1030,8 +1108,8 @@ EOF
   fi
 
   # A plain conf.d/*.conf file is loaded at Apache's global/server scope,
-  # not inside the <VirtualHost _default_:443 _default_:${FREEIPA_PORT}>
-  # block that actually handles FREEIPA_PORT requests, so its RewriteRule/
+  # not inside the <VirtualHost _default_:443> block that handles HTTPS,
+  # so its RewriteRule/
   # ProxyPass directives would never be evaluated. ipa-rewrite.conf avoids
   # this by being Include'd from inside that VirtualHost (see ssl.conf) —
   # mirror that exact pattern here, idempotently.
@@ -1050,7 +1128,8 @@ EOF
     \systemctl restart apache2
   fi
 
-  __log "Configured Apache to reverse-proxy Keycloak under /kc on port ${FREEIPA_PORT}"
+  __log "Configured Apache to reverse-proxy Keycloak under /kc on port 443"
+  __verify_freeipa_http
 }
 
 # - - - - - - - - - - - - - - - - - - - - - - - - -
@@ -1754,94 +1833,6 @@ __configure_keycloak_mail_client() {
 
 # - - - - - - - - - - - - - - - - - - - - - - - - -
 
-# ─── Keycloak nginx vhost ─────────────────────────────────────────────────────
-
-__configure_keycloak_nginx() {
-  if ! \command -v nginx >/dev/null 2>&1; then
-    __log "nginx not found; skipping Keycloak nginx vhost"
-    return 0
-  fi
-
-  __log "Configuring nginx vhost for Keycloak..."
-
-  \mkdir -p /etc/nginx/vhosts.d
-
-  local vhost_file="/etc/nginx/vhosts.d/${FREEIPA_FQDN}-keycloak.conf"
-
-  if [[ "${INSTALL_USE_LETSENCRYPT}" == "true" ]]; then
-    \cat > "${vhost_file}" << EOF
-# Keycloak SSO reverse proxy — generated by install.sh
-server {
-    listen 443 ssl;
-    server_name ${FREEIPA_FQDN};
-
-    ssl_certificate     ${INSTALL_FULLCHAIN_PATH};
-    ssl_certificate_key ${INSTALL_KEY_PATH};
-    ssl_protocols       TLSv1.2 TLSv1.3;
-    ssl_ciphers         HIGH:!aNULL:!MD5;
-
-    access_log /var/log/nginx/${FREEIPA_FQDN}-keycloak.access.log combined;
-    error_log  /var/log/nginx/${FREEIPA_FQDN}-keycloak.error.log warn;
-
-    location / {
-        proxy_pass http://172.17.0.1:${FREEIPA_KEYCLOAK_PORT};
-
-        proxy_set_header Host              \$host;
-        proxy_set_header X-Real-IP         \$remote_addr;
-        proxy_set_header X-Forwarded-For   \$proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto \$scheme;
-        proxy_set_header X-Forwarded-Port  \$server_port;
-
-        proxy_connect_timeout 3600;
-        proxy_send_timeout    3600;
-        proxy_read_timeout    3600;
-        send_timeout          3600;
-
-        proxy_buffer_size        128k;
-        proxy_buffers            4 256k;
-        proxy_busy_buffers_size  256k;
-    }
-}
-EOF
-  else
-    \cat > "${vhost_file}" << EOF
-# Keycloak SSO reverse proxy — generated by install.sh
-# NOTE: TLS is not configured — add ssl_certificate / ssl_certificate_key directives
-#       and change the listen directive to 'listen 443 ssl;' once certificates are in place.
-server {
-    listen 80;
-    server_name ${FREEIPA_FQDN};
-
-    access_log /var/log/nginx/${FREEIPA_FQDN}-keycloak.access.log combined;
-    error_log  /var/log/nginx/${FREEIPA_FQDN}-keycloak.error.log warn;
-
-    location / {
-        proxy_pass http://172.17.0.1:${FREEIPA_KEYCLOAK_PORT};
-
-        proxy_set_header Host              \$host;
-        proxy_set_header X-Real-IP         \$remote_addr;
-        proxy_set_header X-Forwarded-For   \$proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto \$scheme;
-        proxy_set_header X-Forwarded-Port  \$server_port;
-
-        proxy_connect_timeout 3600;
-        proxy_send_timeout    3600;
-        proxy_read_timeout    3600;
-        send_timeout          3600;
-
-        proxy_buffer_size        128k;
-        proxy_buffers            4 256k;
-        proxy_busy_buffers_size  256k;
-    }
-}
-EOF
-  fi
-
-  __log "nginx vhost written: ${vhost_file}"
-
-  \nginx -t 2>/dev/null && \systemctl reload nginx 2>/dev/null || \systemctl reload nginx 2>/dev/null || __warn "nginx reload failed — check config manually"
-}
-
 # - - - - - - - - - - - - - - - - - - - - - - - - -
 
 # ─── Post-install stubs ───────────────────────────────────────────────────────
@@ -1987,45 +1978,35 @@ __setup_freeipa_for_mail() {
   INSTALL_MAIL_CERT_PATH="/etc/mail/certs/mail.pem"
   INSTALL_MAIL_KEY_PATH="/etc/mail/certs/mail.key"
 
-  if [[ "${INSTALL_USE_LETSENCRYPT}" == "true" ]]; then
-    # Mail faces public clients, so it uses the publicly trusted Let's Encrypt
-    # certificate instead of an IPA-issued one; the renewal hook refreshes
-    # this copy and reloads both daemons.
-    \cp "${INSTALL_FULLCHAIN_PATH}" "${INSTALL_MAIL_CERT_PATH}"
-    \cp "${INSTALL_KEY_PATH}" "${INSTALL_MAIL_KEY_PATH}"
-    \restorecon -F "${INSTALL_MAIL_CERT_PATH}" "${INSTALL_MAIL_KEY_PATH}" 2>/dev/null || true
-  else
-    # Request (or reuse) a single IPA-issued certificate shared by Postfix and
-    # Dovecot — tracked and auto-renewed by certmonger. The request itself runs
-    # under the host's own credentials (no admin kinit needed for this part).
-    # -B/-C keep the key group-readable by postfix and reload both daemons
-    # across every certmonger-driven renewal, not just the initial issuance.
-    if ! \getcert list -f "${INSTALL_MAIL_CERT_PATH}" >/dev/null 2>&1; then
-      \ipa-getcert request \
-        -f "${INSTALL_MAIL_CERT_PATH}" \
-        -k "${INSTALL_MAIL_KEY_PATH}" \
-        -N "CN=${FREEIPA_FQDN}" \
-        -K "smtp/${FREEIPA_FQDN}" \
-        -D "${FREEIPA_FQDN}" \
-        -B "chown root:postfix ${INSTALL_MAIL_KEY_PATH}; chmod 640 ${INSTALL_MAIL_KEY_PATH}" \
-        -C "systemctl reload postfix dovecot 2>/dev/null || true" \
-        -w
+  # Mail keeps a FreeIPA-issued certificate, tracked and renewed by certmonger,
+  # regardless of whether Let's Encrypt is configured for Apache HTTPS.
+  if ! \getcert list -f "${INSTALL_MAIL_CERT_PATH}" >/dev/null 2>&1; then
+    if [[ -e "${INSTALL_MAIL_CERT_PATH}" || -e "${INSTALL_MAIL_KEY_PATH}" ]]; then
+      \rm -f "${INSTALL_MAIL_CERT_PATH}" "${INSTALL_MAIL_KEY_PATH}"
     fi
+    \ipa-getcert request \
+      -f "${INSTALL_MAIL_CERT_PATH}" \
+      -k "${INSTALL_MAIL_KEY_PATH}" \
+      -N "CN=${FREEIPA_FQDN}" \
+      -K "smtp/${FREEIPA_FQDN}" \
+      -D "${FREEIPA_FQDN}" \
+      -B "chown root:postfix ${INSTALL_MAIL_KEY_PATH}; chmod 640 ${INSTALL_MAIL_KEY_PATH}" \
+      -C "systemctl reload postfix dovecot 2>/dev/null || true" \
+      -w
+  fi
 
-    # Wait for certmonger to finish issuing the certificate (local CA — fast)
-    local elapsed=0
-    while [[ "${elapsed}" -lt 60 ]]; do
-      if \getcert list -f "${INSTALL_MAIL_CERT_PATH}" 2>/dev/null | \grep -q -- 'status: MONITORING'; then
-        break
-      fi
-      sleep 2
-      elapsed=$(( elapsed + 2 ))
-    done
-    if ! \getcert list -f "${INSTALL_MAIL_CERT_PATH}" 2>/dev/null | \grep -q -- 'status: MONITORING'; then
-      __error "Mail TLS certificate was not issued within 60 seconds (exit 70)"
-      exit 70
+  # Wait for certmonger to finish issuing the certificate (local CA — fast)
+  local elapsed=0
+  while [[ "${elapsed}" -lt 60 ]]; do
+    if \getcert list -f "${INSTALL_MAIL_CERT_PATH}" 2>/dev/null | \grep -q -- 'status: MONITORING'; then
+      break
     fi
-
+    sleep 2
+    elapsed=$(( elapsed + 2 ))
+  done
+  if ! \getcert list -f "${INSTALL_MAIL_CERT_PATH}" 2>/dev/null | \grep -q -- 'status: MONITORING'; then
+    __error "Mail TLS certificate was not issued within 60 seconds (exit 70)"
+    exit 70
   fi
 
   \chown root:postfix "${INSTALL_MAIL_KEY_PATH}"
@@ -2346,7 +2327,7 @@ __display_summary() {
   printf 'Hostname:                  %s\n' "${FREEIPA_FQDN}"
   printf 'Domain:                    %s\n' "${FREEIPA_DOMAIN}"
   printf 'Realm:                     %s\n' "${FREEIPA_REALM}"
-  printf 'Admin port:                %s\n' "${FREEIPA_PORT}"
+  printf 'Web ports:                 HTTP 80 → HTTPS 443\n'
   printf 'Admin username:            admin\n'
   printf 'Admin password:            (saved to %s)\n' "${FREEIPA_CRED_FILE}"
   printf 'Directory Manager pass:    (saved to %s)\n' "${FREEIPA_CRED_FILE}"
@@ -2369,8 +2350,8 @@ __display_summary() {
   printf '==========================================\n\n'
 
   printf 'Access FreeIPA:\n'
-  printf '  Internal URL: https://%s:%s/ipa/ui\n' "${FREEIPA_FQDN}" "${FREEIPA_PORT}"
-  printf '  (Configure your reverse proxy to forward to this URL)\n\n'
+  printf '  HTTP:  http://%s/ipa/ui (redirects to HTTPS)\n' "${FREEIPA_FQDN}"
+  printf '  HTTPS: https://%s/ipa/ui\n\n' "${FREEIPA_FQDN}"
 
   printf 'Service management:\n'
   printf '  ipactl status    — check all services\n'
@@ -2379,11 +2360,10 @@ __display_summary() {
   printf '  ipactl restart   — restart all services\n\n'
 
   printf 'Next steps:\n'
-  printf '  1. Configure your external reverse proxy to forward to https://%s:%s\n' "${FREEIPA_FQDN}" "${FREEIPA_PORT}"
-  printf '  2. Access the admin interface and complete initial setup\n'
-  printf '  3. Retrieve admin and Directory Manager passwords from %s\n' "${FREEIPA_CRED_FILE}"
+  printf '  1. Access the admin interface and complete initial setup\n'
+  printf '  2. Retrieve admin and Directory Manager passwords from %s\n' "${FREEIPA_CRED_FILE}"
   if [[ "${INSTALL_USE_LETSENCRYPT}" == "true" ]]; then
-    printf '  4. Let'"'"'s Encrypt certificates will auto-renew via the installed hook\n'
+    printf '  3. Let'"'"'s Encrypt certificates will auto-renew via the installed hook\n'
   fi
 
   if [[ "${INSTALL_DNS}" == "true" ]]; then
@@ -2391,17 +2371,6 @@ __display_summary() {
     printf '  Set nameserver to: %s\n' "${primary_ip}"
     printf '  Test DNS: dig %s @%s\n' "${FREEIPA_FQDN}" "${primary_ip}"
   fi
-
-  printf '\nNginx reverse proxy snippet:\n'
-  printf '    location / {\n'
-  printf '        proxy_pass https://%s:%s;\n' "${FREEIPA_FQDN}" "${FREEIPA_PORT}"
-  printf '        proxy_set_header Host $host;\n'
-  printf '        proxy_set_header X-Real-IP $remote_addr;\n'
-  printf '        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;\n'
-  printf '        proxy_set_header X-Forwarded-Proto $scheme;\n'
-  printf '        proxy_set_header X-Forwarded-Port $server_port;\n'
-  printf '        proxy_ssl_verify off;\n'
-  printf '    }\n\n'
 
   printf 'Kerberos:\n'
   printf '  kinit admin   — get Kerberos ticket for admin\n'
@@ -2416,7 +2385,7 @@ __display_summary() {
   printf '  %s        — generated credentials\n' "${FREEIPA_CRED_FILE}"
 
   printf '\nKeycloak SSO:\n'
-  printf '  Via Apache:     https://%s:%s/kc\n' "${FREEIPA_FQDN}" "${FREEIPA_PORT}"
+  printf '  Via Apache:     https://%s/kc\n' "${FREEIPA_FQDN}"
   printf '  Direct (internal): http://172.17.0.1:%s\n' "${FREEIPA_KEYCLOAK_PORT}"
   printf '  Admin user:     admin (Keycloak master realm)\n'
   printf '  Admin pass:     (saved to %s)\n' "${FREEIPA_CRED_FILE}"
@@ -2519,17 +2488,7 @@ __main() {
   __migrate_legacy_credential_file "${FREEIPA_CRED_FILE}"
   __migrate_legacy_credential_keys "${FREEIPA_CRED_FILE}"
 
-  # Load or pick stable ports for this installation.
-  # A caller-supplied FREEIPA_PORT/FREEIPA_KEYCLOAK_PORT wins over the saved credential, so
-  # an operator can pin ports without having to hand-edit /etc/ipa/creds.conf first.
-  if [[ -z "${FREEIPA_PORT}" ]]; then
-    FREEIPA_PORT="$(__load_credential "${FREEIPA_CRED_FILE}" FREEIPA_PORT)" || {
-      FREEIPA_PORT="$(__random_port)"
-      __save_credential "${FREEIPA_CRED_FILE}" FREEIPA_PORT "${FREEIPA_PORT}"
-    }
-  fi
-  __log "Selected FreeIPA port: ${FREEIPA_PORT}"
-
+  # A caller-supplied FREEIPA_KEYCLOAK_PORT wins over its saved credential.
   if [[ -z "${FREEIPA_KEYCLOAK_PORT}" ]]; then
     FREEIPA_KEYCLOAK_PORT="$(__load_credential "${FREEIPA_CRED_FILE}" FREEIPA_KEYCLOAK_PORT)" || {
       FREEIPA_KEYCLOAK_PORT="$(__random_port)"
@@ -2538,6 +2497,7 @@ __main() {
   fi
   __log "Selected Keycloak port: ${FREEIPA_KEYCLOAK_PORT}"
 
+  __disable_nginx_service
   __install_prerequisites
   __configure_hosts
   __install_packages
@@ -2546,14 +2506,13 @@ __main() {
   __configure_dns_settings
   __fix_httpd_ports
   __install_freeipa
-  __configure_reverse_proxy
+  __configure_freeipa_http
   __derive_ldap_base_dn
   __setup_freeipa_for_keycloak
   __install_keycloak_docker
   __wait_for_keycloak
   __configure_keycloak
   __configure_apache_keycloak_proxy
-  __configure_keycloak_nginx
   __configure_ad_trust
   __create_initial_objects
   __install_mail_packages
@@ -2565,7 +2524,7 @@ __main() {
   __display_summary
 
   __log "FreeIPA + Keycloak installation and configuration completed"
-  __log "Access the web interface through your reverse proxy"
+  __log "Access the web interface over HTTPS on port 443"
 }
 
 # - - - - - - - - - - - - - - - - - - - - - - - - -

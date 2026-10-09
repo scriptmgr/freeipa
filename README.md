@@ -27,17 +27,17 @@ bash install.sh
 
 1. **Detects your distro family** — RHEL/Fedora/CentOS (see [Supported distributions](#supported-distributions))
 2. **Checks requirements** — 2 GB+ RAM (4 GB+ recommended), 10 GB+ free disk, valid FQDN
-3. **Installs prerequisites** — Docker CE and `jq`, skipped if already present
-4. **Configures `/etc/hosts`, NTP/Chrony, and DNS forwarders** automatically
-5. **Selects SSL certificates** — reuses an existing Let's Encrypt certificate if found, otherwise falls back to FreeIPA's built-in CA. FreeIPA is always installed with its own CA (Kerberos, PKINIT and host certificates stay IPA-issued); a Let's Encrypt certificate is installed afterwards only on the public-facing TLS endpoints — the web UI/API (HTTPS), the directory server (LDAPS) and Postfix/Dovecot — and renewals are re-applied by a certbot deploy hook
-6. **Installs and configures FreeIPA** (`ipa-server-install --unattended`), generating and saving the admin and Directory Manager passwords
-7. **Configures Apache for reverse-proxy use** on a random high port so an external reverse proxy can front FreeIPA
-8. **Federates Keycloak against FreeIPA LDAP** — creates a `keycloak` LDAP bind account, an `HTTP` Kerberos service principal, and exports a keytab plus the IPA CA certificate
-9. **Deploys Keycloak via Docker Compose** — Postgres + Keycloak, with Kerberos SPNEGO wired to FreeIPA
-10. **Configures the Keycloak realm over its REST API** — creates the realm, the LDAP user federation component, triggers a full sync, and promotes the admin user to `realm-admin`
-11. **Writes an nginx vhost for Keycloak**, if nginx is installed
+3. **Stops, disables, and masks nginx** when it is installed; FreeIPA Apache owns ports 80 and 443 and the installer does not install nginx
+4. **Installs prerequisites** — Docker CE and `jq`, skipped if already present
+5. **Configures `/etc/hosts`, NTP/Chrony, and DNS forwarders** automatically
+6. **Selects the HTTPS certificate** — if a matching Let's Encrypt certificate exists, it is installed only for FreeIPA's Apache HTTPS endpoint; otherwise FreeIPA's built-in CA certificate is used. LDAP/LDAPS, Kerberos, PKINIT, and mail continue using FreeIPA-issued certificates. The deploy hook updates only the Apache HTTPS certificate after renewal
+7. **Installs and configures FreeIPA** (`ipa-server-install --unattended`), generating and saving the admin and Directory Manager passwords
+8. **Serves FreeIPA directly through Apache** on ports 80 and 443; HTTP requests redirect to HTTPS and the installer verifies both listeners. Hosts that run Apache on ports 81/8443 behind another web server are handled first: `Listen 81` becomes `Listen 80`, `Listen 8443` and the virtual hosts bound to 81/8443 are disabled (FreeIPA's CA needs 8443, and a leftover vhost on 443 would sit in front of FreeIPA), and a packaged `mod_ssl` `ssl.conf` is restored when the existing one has no virtual host. Every file changed is kept as `<file>.pre-freeipa`
+9. **Federates Keycloak against FreeIPA LDAP** — creates a `keycloak` LDAP bind account, an `HTTP` Kerberos service principal, and exports a keytab plus the IPA CA certificate
+10. **Deploys Keycloak via Docker Compose** — Postgres + Keycloak, with Kerberos SPNEGO wired to FreeIPA
+11. **Configures the Keycloak realm over its REST API** — creates the realm, the LDAP user federation component, triggers a full sync, and promotes the admin user to `realm-admin`
 12. **Configures AD trust support** (`ipa-adtrust-install --add-sids`), unconditionally — RHEL-family and Fedora only, since no working `freeipa-server` package exists for Debian/Ubuntu/openSUSE (see [Supported distributions](#supported-distributions))
-13. **Installs and configures Postfix and Dovecot** — LDAP-authenticated virtual mailboxes backed by FreeIPA, with an IPA-issued, certmonger-tracked TLS certificate shared by both. Postfix accepts mail for `FREEIPA_MAIL_DOMAIN` and any `*.FREEIPA_MAIL_DOMAIN` subdomain (via a `regexp:` virtual-domain map — Postfix has no native glob syntax). Dovecot also supports a Unix/PAM local-account fallback (tried when a user isn't found in LDAP) and Keycloak OAUTHBEARER/XOAUTH2 via token introspection for IMAP/POP3 clients that support it — both on by default, each independently toggleable
+13. **Installs and configures Postfix and Dovecot** — LDAP-authenticated virtual mailboxes backed by FreeIPA, with a FreeIPA-issued, certmonger-tracked TLS certificate shared by both. Postfix accepts mail for `FREEIPA_MAIL_DOMAIN` and any `*.FREEIPA_MAIL_DOMAIN` subdomain (via a `regexp:` virtual-domain map — Postfix has no native glob syntax). Dovecot also supports a Unix/PAM local-account fallback (tried when a user isn't found in LDAP) and Keycloak OAUTHBEARER/XOAUTH2 via token introspection for IMAP/POP3 clients that support it — both on by default, each independently toggleable
 14. Prints an installation summary with access URLs, credential locations, and next steps
 
 All steps are idempotent — re-running the script detects existing installs (FreeIPA, the Keycloak container, generated credentials) and skips them.
@@ -78,7 +78,6 @@ on Debian/Ubuntu/openSUSE rather than attempting a broken install.
 | `FREEIPA_FQDN` | auto-detected | Override the detected hostname |
 | `FREEIPA_DOMAIN` | auto-detected | Override the detected domain |
 | `FREEIPA_REALM` | auto-detected | Override the detected Kerberos realm |
-| `FREEIPA_PORT` | random, 62000–64999 | Reverse-proxy HTTPS port; labelled `http_port_t` for httpd when `semanage` is present |
 | `FREEIPA_CRED_FILE` | `/etc/ipa/creds.conf` | Generated-credentials file path |
 | `FREEIPA_DEBUG` | `0` | Enable debug output when set to `1` (same as `--debug`) |
 | `FREEIPA_KEYCLOAK_PORT` | random, 62000–64999 | Keycloak HTTP port |
@@ -94,9 +93,9 @@ on Debian/Ubuntu/openSUSE rather than attempting a broken install.
 | `FREEIPA_MAIL_KEYCLOAK_CLIENT_ID` | `dovecot-mail` | Keycloak client ID whose tokens the Dovecot passdb introspects |
 | `NO_COLOR` | unset | Disable color output when set |
 
-`FREEIPA_PORT` and `FREEIPA_KEYCLOAK_PORT` take precedence over the port recorded
-in `FREEIPA_CRED_FILE`, so a port can be pinned without hand-editing the
-credentials file.
+`FREEIPA_KEYCLOAK_PORT` takes precedence over the port recorded in
+`FREEIPA_CRED_FILE`, so the Keycloak port can be pinned without hand-editing
+the credentials file.
 
 **Keycloak mail client note:** the confidential `dovecot-mail` client created for
 token introspection only authenticates Dovecot to Keycloak — it does not issue
@@ -105,6 +104,19 @@ Keycloak client, and that client needs an **audience mapper** targeting
 `FREEIPA_MAIL_KEYCLOAK_CLIENT_ID` (`dovecot-mail` by default) so the token's
 `aud` claim includes it — Keycloak's introspection endpoint reports tokens
 without a matching audience as inactive.
+
+---
+
+## Active Directory integration
+
+The installer enables FreeIPA's Samba based AD trust support. This lets FreeIPA
+establish a forest trust with a separate Microsoft Active Directory domain
+controller and resolve/authenticate trusted AD users for supported services.
+It does **not** turn FreeIPA into a Microsoft AD domain controller, and Windows
+workstations cannot join the FreeIPA realm as if it were AD. Testing the trust
+feature requires a separate Windows Server VM with AD DS and DNS configured;
+a Windows client VM is optional for testing workstation access within that AD
+domain. See the [FreeIPA AD trust requirements](https://www.freeipa.org/page/Active_Directory_trust_setup.html).
 
 ---
 

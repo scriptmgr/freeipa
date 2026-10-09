@@ -340,7 +340,11 @@ __configure_hostname() {
     fi
     FREEIPA_FQDN="${FREEIPA_FQDN,,}"
     __log "Hostname was not fully qualified; using ${FREEIPA_FQDN}"
+  fi
 
+  local current_hostname
+  current_hostname="$(\hostnamectl --static 2>/dev/null || \hostname)"
+  if [[ "${current_hostname,,}" != "${FREEIPA_FQDN}" ]]; then
     # hostnamectl requires systemd; Alpine (OpenRC) and other non-systemd
     # distros have no such binary, so fall back to setting /etc/hostname and
     # the kernel hostname directly — the same end state hostnamectl reaches
