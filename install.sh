@@ -875,6 +875,16 @@ __install_freeipa() {
 
 # ─── Reverse proxy Apache configuration ──────────────────────────────────────
 
+__fix_httpd_ports() {
+  local check_ports f 
+  check_ports="$(grep -sR 8443 "/etc/httpd/conf"|awk -F: '{print $1}')"
+  if [ -n "$check_ports" ]; then 
+    for f in $check_ports; do
+      sed -i 's|:81>|:80>|g' "$f" 
+      sed -i 's|:8443>|:443>|g' "$f" 
+  fi
+}
+
 __configure_reverse_proxy() {
   __log "Configuring FreeIPA for reverse proxy setup..."
 
@@ -2534,6 +2544,7 @@ __main() {
   __configure_ntp_settings
   __configure_ssl_certs
   __configure_dns_settings
+  __fix_httpd_ports
   __install_freeipa
   __configure_reverse_proxy
   __derive_ldap_base_dn
