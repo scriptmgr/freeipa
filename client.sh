@@ -185,7 +185,7 @@ __help() {
   printf '      --no-color          Disable color output\n\n'
   printf 'Environment:\n'
   printf '  FREEIPA_SERVER           FreeIPA server FQDN (required, or --server)\n'
-  printf '  FREEIPA_SERVER_IP        Server IP, if not DNS-resolvable (adds /etc/hosts entry)\n'
+  printf '  FREEIPA_SERVER_IP        Server IP; always written to /etc/hosts for the server name (required if it is not DNS-resolvable)\n'
   printf '  FREEIPA_FQDN             Override this host'"'"'s auto-detected FQDN\n'
   printf '  FREEIPA_DOMAIN           Override auto-detected domain\n'
   printf '  FREEIPA_REALM            Override auto-detected Kerberos realm\n'
@@ -375,14 +375,18 @@ __configure_hostname() {
   \sed -i "/[[:space:]]${FREEIPA_FQDN}\$/d" /etc/hosts
   printf '127.0.1.1 %s %s\n' "${FREEIPA_FQDN}" "${short_hostname}" >> /etc/hosts
 
-  if ! \getent hosts "${FREEIPA_SERVER}" >/dev/null 2>&1; then
-    if [[ -n "${FREEIPA_SERVER_IP}" ]]; then
-      __warn "${FREEIPA_SERVER} is not DNS-resolvable; adding /etc/hosts entry using FREEIPA_SERVER_IP"
-      \sed -i "/[[:space:]]${FREEIPA_SERVER}\$/d" /etc/hosts
-      printf '%s %s\n' "${FREEIPA_SERVER_IP}" "${FREEIPA_SERVER}" >> /etc/hosts
+  # An explicit FREEIPA_SERVER_IP always wins: the name may resolve publicly to a different address
+  # (a wildcard record, a split-horizon setup), which would send enrollment to the wrong host.
+  if [[ -n "${FREEIPA_SERVER_IP}" ]]; then
+    if \getent hosts "${FREEIPA_SERVER}" >/dev/null 2>&1; then
+      __log "Pinning ${FREEIPA_SERVER} to ${FREEIPA_SERVER_IP} in /etc/hosts (FREEIPA_SERVER_IP)"
     else
-      __error "${FREEIPA_SERVER} is not DNS-resolvable; set FREEIPA_SERVER_IP to add an /etc/hosts entry"
+      __warn "${FREEIPA_SERVER} is not DNS-resolvable; adding /etc/hosts entry using FREEIPA_SERVER_IP"
     fi
+    \sed -i "/[[:space:]]${FREEIPA_SERVER}\$/d" /etc/hosts
+    printf '%s %s\n' "${FREEIPA_SERVER_IP}" "${FREEIPA_SERVER}" >> /etc/hosts
+  elif ! \getent hosts "${FREEIPA_SERVER}" >/dev/null 2>&1; then
+    __error "${FREEIPA_SERVER} is not DNS-resolvable; set FREEIPA_SERVER_IP to add an /etc/hosts entry"
   fi
 }
 

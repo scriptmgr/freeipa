@@ -30,14 +30,14 @@ bash install.sh
 3. **Stops, disables, and masks nginx** when it is installed; FreeIPA Apache owns ports 80 and 443 and the installer does not install nginx
 4. **Installs prerequisites** — Docker CE and `jq`, skipped if already present
 5. **Configures `/etc/hosts`, NTP/Chrony, and DNS forwarders** automatically
-6. **Selects the HTTPS certificate** — if a matching Let's Encrypt certificate exists, it is installed only for FreeIPA's Apache HTTPS endpoint; otherwise FreeIPA's built-in CA certificate is used. LDAP/LDAPS, Kerberos, PKINIT, and mail continue using FreeIPA-issued certificates. The deploy hook updates only the Apache HTTPS certificate after renewal
+6. **Selects the public certificate** — if a Let's Encrypt (publicly trusted) certificate for the server's FQDN exists, it is used for every public-facing service: Apache HTTPS (IPA UI and `/kc`), LDAP/LDAPS, Postfix and Dovecot. Otherwise FreeIPA's built-in CA certificate is used for them. Kerberos/PKINIT, the Dogtag CA and IPA service certificates always stay IPA-issued. A self-signed or private-CA certificate under `/etc/letsencrypt/live/` is never treated as a Let's Encrypt certificate.
 7. **Installs and configures FreeIPA** (`ipa-server-install --unattended`), generating and saving the admin and Directory Manager passwords
 8. **Serves FreeIPA directly through Apache** on ports 80 and 443; HTTP requests redirect to HTTPS and the installer verifies both listeners. Hosts that run Apache on ports 81/8443 behind another web server are handled first: `Listen 81` becomes `Listen 80`, `Listen 8443` and the virtual hosts bound to 81/8443 are disabled (FreeIPA's CA needs 8443, and a leftover vhost on 443 would sit in front of FreeIPA), and a packaged `mod_ssl` `ssl.conf` is restored when the existing one has no virtual host. Every file changed is kept as `<file>.pre-freeipa`
 9. **Federates Keycloak against FreeIPA LDAP** — creates a `keycloak` LDAP bind account, an `HTTP` Kerberos service principal, and exports a keytab plus the IPA CA certificate
 10. **Deploys Keycloak via Docker Compose** — Postgres + Keycloak, with Kerberos SPNEGO wired to FreeIPA
 11. **Configures the Keycloak realm over its REST API** — creates the realm, the LDAP user federation component, triggers a full sync, and promotes the admin user to `realm-admin`
 12. **Configures AD trust support** (`ipa-adtrust-install --add-sids`), unconditionally — RHEL-family and Fedora only, since no working `freeipa-server` package exists for Debian/Ubuntu/openSUSE (see [Supported distributions](#supported-distributions))
-13. **Installs and configures Postfix and Dovecot** — LDAP-authenticated virtual mailboxes backed by FreeIPA, with a FreeIPA-issued, certmonger-tracked TLS certificate shared by both. Postfix accepts mail for `FREEIPA_MAIL_DOMAIN` and any `*.FREEIPA_MAIL_DOMAIN` subdomain (via a `regexp:` virtual-domain map — Postfix has no native glob syntax). Dovecot also supports a Unix/PAM local-account fallback (tried when a user isn't found in LDAP) and Keycloak OAUTHBEARER/XOAUTH2 via token introspection for IMAP/POP3 clients that support it — both on by default, each independently toggleable
+13. **Installs and configures Postfix and Dovecot** — LDAP-authenticated virtual mailboxes backed by FreeIPA, with one TLS certificate shared by both (the Let's Encrypt certificate when present, otherwise a FreeIPA-issued, certmonger-tracked one). Postfix accepts mail for `FREEIPA_MAIL_DOMAIN` and any `*.FREEIPA_MAIL_DOMAIN` subdomain (via a `regexp:` virtual-domain map — Postfix has no native glob syntax). Dovecot also supports a Unix/PAM local-account fallback (tried when a user isn't found in LDAP) and Keycloak OAUTHBEARER/XOAUTH2 via token introspection for IMAP/POP3 clients that support it — both on by default, each independently toggleable
 14. Prints an installation summary with access URLs, credential locations, and next steps
 
 All steps are idempotent — re-running the script detects existing installs (FreeIPA, the Keycloak container, generated credentials) and skips them.
@@ -60,7 +60,17 @@ already an enrolled IPA client is refused (exit 78, nothing changed; run
 distributions exit 79.
 
 A Let's Encrypt certificate is only used when it covers the server's FQDN, is not
-expired, and its private key matches; otherwise the FreeIPA CA certificate is used.
+expired, its private key matches and it chains to a publicly trusted CA; otherwise the
+FreeIPA CA certificate is used.
+
+Renewal: `install.sh` installs a certbot deploy hook,
+`/etc/letsencrypt/renewal-hooks/deploy/freeipa-renew.sh`. For this host's certificate
+only (it ignores other lineages) it imports the issuing chain and root into IPA's trust,
+installs the certificate for Apache and the directory server (`ipa-server-certinstall -w -d`),
+restarts the IPA services and reloads Postfix and Dovecot. A renewal tool other than
+certbot must call this script with `RENEWED_LINEAGE` set to the certificate directory.
+The install ignores SIGHUP, so a dropped SSH session does not kill it half way; run it
+under `tmux`/`screen` if you want to watch the output after reconnecting.
 `--debug` additionally prints the `ipa-server-install` command line (passwords
 masked), the Apache files rewritten and why a certificate was skipped.
 

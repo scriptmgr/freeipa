@@ -78,6 +78,7 @@ INSTALL_KEYCLOAK_DB_PASSWORD=""
 FREEIPA_COMPOSE_DIR="${FREEIPA_COMPOSE_DIR:-/opt/keycloak}"
 FREEIPA_KEYCLOAK_CONFIG_DIR="${FREEIPA_KEYCLOAK_CONFIG_DIR:-/etc/keycloak}"
 INSTALL_LDIF_TMP=""
+INSTALL_CCACHE_DIR=""
 # - - - - - - - - - - - - - - - - - - - - - - - - -
 # Mail (Postfix/Dovecot) globals
 FREEIPA_MAIL_DOMAIN="${FREEIPA_MAIL_DOMAIN:-}"
@@ -297,6 +298,7 @@ __version() {
 
 __cleanup() {
   [[ -n "${INSTALL_LDIF_TMP}" && -f "${INSTALL_LDIF_TMP}" ]] && \rm -f "${INSTALL_LDIF_TMP}" 2>/dev/null || true
+  [[ -n "${INSTALL_CCACHE_DIR:-}" && -d "${INSTALL_CCACHE_DIR}" ]] && \rm -rf "${INSTALL_CCACHE_DIR}" 2>/dev/null || true
 }
 
 # Diagnostic only — set -e already aborts on the failing command; this just
@@ -355,14 +357,26 @@ __preflight_freeipa_state() {
       ;;
   esac
   __freeipa_server_configured && return 0
+
+  local foreign
+  if foreign="$(__httpd_foreign_ssl_vhost)"; then
+    __error "An HTTPS virtual host on port 443 is already defined in ${foreign}; FreeIPA needs port 443 for its web UI. Nothing was changed. Move that virtual host to another port (for example 8443) or disable it, then re-run (exit 81)"
+  fi
+
   [[ -f /etc/ipa/default.conf ]] || return 0
 
-  # An enrolled client records its enrollment under the client sysrestore dir; refuse to touch it
-  if [[ -f /var/lib/ipa-client/sysrestore/sysrestore.state ]] || ! \command -v ipa-server-install >/dev/null 2>&1; then
+  # An aborted ipa-server-install leaves server directories behind (even after its client part was configured);
+  # a plain enrolled client has only the client sysrestore state
+  local has_server_remnants=0 d
+  for d in /etc/dirsrv/slapd-* /var/lib/pki/pki-tomcat /etc/pki/pki-tomcat /var/lib/ipa/sysrestore/sysrestore.state; do
+    [[ -e "${d}" ]] && has_server_remnants=1
+  done
+  if ! \command -v ipa-server-install >/dev/null 2>&1 \
+    || { [[ -f /var/lib/ipa-client/sysrestore/sysrestore.state ]] && [[ "${has_server_remnants}" -eq 0 ]]; }; then
     __error "/etc/ipa/default.conf exists but no FreeIPA server is configured here (this host is an IPA client or has foreign IPA state). Nothing was changed. Run 'ipa-client-install --uninstall' or remove the stale configuration, then re-run (exit 78)"
   fi
 
-  # Otherwise this is what an aborted ipa-server-install leaves behind; clear it so the install can be re-run
+  # What remains is an aborted ipa-server-install; clear it so the install can be re-run
   __warn "Found remnants of an aborted FreeIPA server install; removing them with ipa-server-install --uninstall"
   \ipa-server-install --uninstall --unattended \
     || __error "Could not clean up the aborted FreeIPA install; see /var/log/ipaserver-uninstall.log (exit 78)"
@@ -501,7 +515,7 @@ __install_packages() {
       fi
       __log "Installing FreeIPA packages via ${pkg_mgr}..."
       "${pkg_mgr}" update -y
-      "${pkg_mgr}" install -y ipa-server ipa-server-dns ipa-server-trust-ad bind-utils chrony openldap-clients
+      __install_ipa_packages "${pkg_mgr}" ipa-server ipa-server-dns ipa-server-trust-ad bind-utils chrony openldap-clients
       ;;
 
     # Fedora renamed the ipa-* packages to freeipa-* (RHEL/CentOS/Alma/Rocky
@@ -515,7 +529,7 @@ __install_packages() {
       fi
       __log "Installing FreeIPA packages via ${pkg_mgr}..."
       "${pkg_mgr}" update -y
-      "${pkg_mgr}" install -y freeipa-server freeipa-server-dns freeipa-server-trust-ad bind-utils chrony openldap-clients
+      __install_ipa_packages "${pkg_mgr}" freeipa-server freeipa-server-dns freeipa-server-trust-ad bind-utils chrony openldap-clients
       ;;
 
     # No freeipa-server package exists for Debian/Ubuntu/openSUSE: verified
@@ -557,6 +571,10 @@ __configure_hosts() {
 
   __log "Using IP address: ${primary_ip}"
 
+  # Remove stale aliases for the primary IP so reverse lookups return the IPA hostname.
+  local escaped_ip="${primary_ip//./\\.}"
+  \sed -i -E "/^[[:space:]]*${escaped_ip}[[:space:]]/d" /etc/hosts
+
   # Remove any existing entries for this FQDN then re-add with correct IP
   \sed -i "/${FREEIPA_FQDN}/d" /etc/hosts
   short_hostname="${FREEIPA_FQDN%%.*}"
@@ -594,6 +612,11 @@ __check_letsencrypt_certs() {
     fi
     if [[ "$(\openssl x509 -in "${cert_dir}/cert.pem" -noout -pubkey 2>/dev/null || true)" != "$(\openssl pkey -in "${cert_dir}/privkey.pem" -pubout 2>/dev/null || true)" ]]; then
       __warn "Skipping Let's Encrypt certificate ${cert_name}: private key does not match"
+      continue
+    fi
+    # Self-signed and private-CA certificates (e.g. a bootstrap's placeholder under live/) are not for FreeIPA's public endpoints
+    if ! \openssl verify -untrusted "${cert_dir}/fullchain.pem" "${cert_dir}/cert.pem" >/dev/null 2>&1; then
+      __warn "Skipping certificate ${cert_name}: not issued by a publicly trusted CA"
       continue
     fi
     # Skip the README file that certbot places in the directory
@@ -777,56 +800,109 @@ __configure_ntp_settings() {
 # ─── Let's Encrypt renewal hook ──────────────────────────────────────────────
 
 __configure_letsencrypt_renewal() {
-  __log "Installing Let's Encrypt certificate for FreeIPA HTTPS only and creating renewal hook..."
+  __log "Installing Let's Encrypt certificate for FreeIPA HTTPS and LDAPS (mail reads it directly) and creating renewal hook..."
 
   local renewal_hook_dir="/etc/letsencrypt/renewal-hooks/deploy"
   local hook="${renewal_hook_dir}/freeipa-renew.sh"
   \mkdir -p "${renewal_hook_dir}"
 
-  # The Let's Encrypt leaf certificate is installed only for Apache HTTPS.
-  # FreeIPA keeps IPA-issued certificates for LDAP, Kerberos, PKINIT, and mail.
-  # The issuer chain is added to IPA trust so Apache can validate the HTTPS cert.
+  # The Let's Encrypt certificate serves every public-facing service: Apache HTTPS and LDAPS here,
+  # Postfix and Dovecot straight from the same files. Kerberos, PKINIT and the CA keep IPA-issued certificates.
+  # The issuer chain is added to IPA trust so IPA clients and services can validate it.
   {
     printf '#!/usr/bin/env sh\n'
     printf 'CRED_FILE=%q\n' "${FREEIPA_CRED_FILE}"
+    printf 'FQDN=%q\n' "${FREEIPA_FQDN}"
     \cat << 'HOOKEOF'
 # FreeIPA public certificate hook for Let's Encrypt (managed by install.sh)
 # Run by certbot after a successful renewal, and once by install.sh.
 
 LINEAGE="${RENEWED_LINEAGE:?RENEWED_LINEAGE not set}"
 CERT_PATH="${LINEAGE}/fullchain.pem"
+LEAF_PATH="${LINEAGE}/cert.pem"
 KEY_PATH="${LINEAGE}/privkey.pem"
 CHAIN_PATH="${LINEAGE}/chain.pem"
 
-[ -f "${CERT_PATH}" ] && [ -f "${KEY_PATH}" ] || exit 0
+[ -f "${CERT_PATH}" ] && [ -f "${LEAF_PATH}" ] && [ -f "${KEY_PATH}" ] || exit 0
+
+# certbot runs every deploy hook for every lineage it renews; only act for this host's certificate
+openssl x509 -in "${LEAF_PATH}" -noout -checkhost "${FQDN}" >/dev/null 2>&1 || exit 0
+openssl x509 -in "${LEAF_PATH}" -noout -checkend 0 >/dev/null 2>&1 || exit 0
+[ "$(openssl x509 -in "${LEAF_PATH}" -noout -pubkey 2>/dev/null)" = "$(openssl pkey -in "${KEY_PATH}" -pubout 2>/dev/null)" ] || exit 0
+openssl verify -untrusted "${CERT_PATH}" "${LEAF_PATH}" >/dev/null 2>&1 || exit 0
 
 cred() { sed -n "s/^$1=//p" "${CRED_FILE}" | tail -n1; }
 DM_PASS="$(cred INSTALL_DM_PASSWORD)"
 ADMIN_PASS="$(cred INSTALL_ADMIN_PASSWORD)"
 rc=0
 
-# Make IPA trust the issuing chain so ipa-server-certinstall can validate it
-# and IPA clients/Keycloak/Dovecot verify LDAPS against /etc/ipa/ca.crt.
+# Make IPA trust the issuing chain so ipa-server-certinstall can validate it and IPA clients, sssd,
+# Keycloak, Postfix and Dovecot verify LDAPS against /etc/ipa/ca.crt. The served chain normally stops at
+# the intermediate; OpenSSL clients need the root as well, which comes from the system trust store.
 if [ -f "${CHAIN_PATH}" ]; then
+  TRUST_DIR="$(mktemp -d)"
+  cp "${CHAIN_PATH}" "${TRUST_DIR}/chain.pem"
+  python3 - "${CHAIN_PATH}" "${TRUST_DIR}/root.pem" <<'PYEOF' || true
+import re, sys
+from cryptography import x509
+from cryptography.hazmat.primitives import serialization
+
+def load_all(path):
+    data = open(path, 'rb').read().decode('ascii', 'ignore')
+    pems = re.findall(r'-----BEGIN CERTIFICATE-----.*?-----END CERTIFICATE-----', data, re.S)
+    return [x509.load_pem_x509_certificate(p.encode()) for p in pems]
+
+chain = load_all(sys.argv[1])
+if not chain:
+    sys.exit(0)
+top = chain[-1]
+if top.subject == top.issuer:
+    sys.exit(0)
+for bundle in ('/etc/pki/tls/certs/ca-bundle.crt', '/etc/ssl/certs/ca-certificates.crt'):
+    try:
+        candidates = load_all(bundle)
+    except OSError:
+        continue
+    for cand in candidates:
+        if cand.subject == top.issuer:
+            open(sys.argv[2], 'wb').write(cand.public_bytes(serialization.Encoding.PEM))
+            sys.exit(0)
+PYEOF
+  # The default credential cache can be unusable (KCM without sssd-kcm); use a private one
+  CCACHE="$(mktemp)"
+  KRB5CCNAME="FILE:${CCACHE}"
+  export KRB5CCNAME
   if printf '%s\n' "${ADMIN_PASS}" | kinit admin >/dev/null 2>&1; then
-    if ! out="$(ipa-cacert-manage install -t C,, "${CHAIN_PATH}" 2>&1)"; then
-      printf '%s\n' "${out}" | grep -qi 'already' || { printf '%s\n' "${out}" >&2; rc=1; }
-    fi
+    for f in "${TRUST_DIR}/root.pem" "${TRUST_DIR}/chain.pem"; do
+      [ -s "${f}" ] || continue
+      if ! out="$(ipa-cacert-manage install -t C,, "${f}" 2>&1)"; then
+        printf '%s\n' "${out}" | grep -qi 'already' || { printf '%s\n' "${out}" >&2; rc=1; }
+      fi
+    done
     ipa-certupdate >/dev/null 2>&1 || rc=1
     kdestroy >/dev/null 2>&1 || true
   else
     echo "kinit admin failed" >&2
     rc=1
   fi
+  rm -rf "${TRUST_DIR}"
+  rm -f "${CCACHE}"
 fi
 
-if ipa-server-certinstall -w --pin= -p "${DM_PASS}" "${KEY_PATH}" "${CERT_PATH}"; then
-  systemctl restart httpd || rc=1
+# One certificate for every public-facing service that FreeIPA itself runs: Apache HTTPS and LDAPS.
+# Postfix and Dovecot read the same files directly. Kerberos/PKINIT and the CA keep IPA-issued certificates.
+if ipa-server-certinstall -w -d --pin= -p "${DM_PASS}" "${KEY_PATH}" "${CERT_PATH}"; then
+  ipactl restart >/dev/null 2>&1 || rc=1
 else
   rc=1
 fi
+for svc in postfix dovecot; do
+  if systemctl is-active --quiet "${svc}" 2>/dev/null; then
+    systemctl reload "${svc}" || rc=1
+  fi
+done
 
-logger -t letsencrypt "FreeIPA HTTPS certificate installed from ${LINEAGE} (rc=${rc})"
+logger -t letsencrypt "FreeIPA HTTPS/LDAPS/mail certificate installed from ${LINEAGE} (rc=${rc})"
 exit "${rc}"
 HOOKEOF
   } > "${hook}"
@@ -834,13 +910,35 @@ HOOKEOF
   __log "Renewal hook created: ${hook}"
 
   if ! RENEWED_LINEAGE="${INSTALL_FULLCHAIN_PATH%/*}" "${hook}"; then
-    __error "Could not install the Let's Encrypt certificate on FreeIPA HTTPS (exit 71)"
+    __error "Could not install the Let's Encrypt certificate on FreeIPA HTTPS/LDAPS (exit 71)"
   fi
 }
 
 # - - - - - - - - - - - - - - - - - - - - - - - - -
 
 # ─── FreeIPA installation ────────────────────────────────────────────────────
+
+# FreeIPA needs python3-mod_wsgi (the system Python). A Python-version-specific mod_wsgi from another repo
+# (python3.11-mod_wsgi ...) ships the same files and cannot coexist with it in one Apache process, so
+# the transaction conflicts. Remove only that package, say so, and retry once.
+__install_ipa_packages() {
+  local pkg_mgr="$1"
+  shift
+  if "${pkg_mgr}" install -y "$@"; then
+    return 0
+  fi
+  local alt
+  alt="$(\rpm -qa 2>/dev/null | \grep -E '^python3\.[0-9]+-mod_wsgi-' || true)"
+  if [[ -z "${alt}" ]]; then
+    return 1
+  fi
+  local p
+  while IFS= read -r p; do
+    __warn "Removing ${p}: it conflicts with the python3-mod_wsgi that FreeIPA requires"
+    "${pkg_mgr}" remove -y "${p}" || return 1
+  done <<< "${alt}"
+  "${pkg_mgr}" install -y "$@"
+}
 
 __install_freeipa() {
   # Idempotency guard — skip if FreeIPA is already installed
@@ -854,6 +952,9 @@ __install_freeipa() {
       __warn "FreeIPA installed but DM password not found in ${FREEIPA_CRED_FILE}"
     }
     if [[ "${INSTALL_USE_LETSENCRYPT}" == "true" ]]; then
+      # Nginx may have owned ports 80/443 and kept Apache stopped on an existing host.
+      # Start and verify FreeIPA's HTTP endpoint before certinstall calls its HTTPS API.
+      __configure_freeipa_http
       __configure_letsencrypt_renewal
     fi
     return 0
@@ -966,6 +1067,7 @@ __fix_httpd_ports() {
   fi
 
   __ensure_stock_ssl_conf
+  __ensure_httpd_modules
 
   # A running httpd keeps its old sockets until restarted. Key this on what it
   # is actually listening on, not on whether files changed, so a re-run after a
@@ -984,6 +1086,107 @@ __fix_httpd_ports() {
   done
 }
 
+# FreeIPA's ipa.conf uses directives from several Apache modules. Hosts whose
+# httpd.conf lists modules inline and does not include conf.modules.d (with the
+# packaged module configs emptied) never load mod_auth_gssapi and friends, so
+# httpd refuses to start with "Invalid command 'GssapiUseSessions'". Load only
+# the missing ones through a drop-in; the administrator's own modules are untouched.
+__ensure_httpd_modules() {
+  if ! \command -v httpd >/dev/null 2>&1; then
+    __debug "httpd is not installed; skipping the Apache module check"
+    return 0
+  fi
+  [[ -d /etc/httpd/conf.d ]] || return 0
+  if __freeipa_server_configured; then
+    __debug "FreeIPA server already configured; skipping the Apache module check"
+    return 0
+  fi
+
+  # Some repositories ship python3-mod_wsgi with a module config that loads mod_wsgi_python3.so while the
+  # package only provides mod_wsgi.so, so httpd cannot start at all. The config guards that LoadModule
+  # with <IfModule !wsgi_module>; loading wsgi_module from the file that exists first satisfies it
+  # without touching package-owned files.
+  # mod_ssl generates its default localhost certificate when httpd first starts (httpd-init.service); a host
+  # whose httpd could never start lacks it and ssl.conf then fails to parse, hiding every other problem
+  if [[ ! -s /etc/pki/tls/certs/localhost.crt && -x /usr/libexec/httpd-ssl-gencerts ]]; then
+    __debug "Generating mod_ssl's default localhost certificate (httpd-ssl-gencerts)"
+    \/usr/libexec/httpd-ssl-gencerts >/dev/null 2>&1 || true
+  fi
+
+  local test_out
+  if ! test_out="$(\httpd -t 2>&1)"; then
+    if [[ "${test_out}" == *"Cannot load modules/mod_wsgi_python3.so"* \
+      && -e /etc/httpd/modules/mod_wsgi.so && -d /etc/httpd/conf.modules.d ]]; then
+      local wsgi_fix="/etc/httpd/conf.modules.d/00-freeipa-wsgi.conf"
+      printf '# Written by install.sh: the packaged module config references a mod_wsgi_python3.so that does not exist\nLoadModule wsgi_module modules/mod_wsgi.so\n' > "${wsgi_fix}"
+      # Only the dangling reference has to be gone; anything else is reported by the checks below
+      if [[ "$(\httpd -t 2>&1 || true)" != *"mod_wsgi_python3.so"* ]]; then
+        __log "Added ${wsgi_fix}: the packaged mod_wsgi config references a file that does not exist"
+      else
+        \rm -f "${wsgi_fix}"
+        return 0
+      fi
+      if ! \httpd -t >/dev/null 2>&1; then
+        __debug "Apache configuration still has errors after the mod_wsgi repair; skipping the module check"
+        return 0
+      fi
+    else
+      # Any other broken configuration cannot be repaired here; the later checks report it
+      __debug "Apache configuration is invalid and not repairable here: ${test_out}"
+      return 0
+    fi
+  fi
+
+  local dropin="/etc/httpd/conf.d/00-freeipa-modules.conf" loaded m so cand
+  local -a missing=() lines=()
+  loaded="$(\httpd -M 2>/dev/null || true)"
+  # Modules for the directives ipa.conf, ipa-rewrite.conf, ipa-pki-proxy.conf and mod_ssl's ssl.conf use;
+  # ipa.conf loads mod_lookup_identity itself
+  for m in auth_gssapi wsgi session session_cookie proxy proxy_http rewrite headers ssl expires \
+    alias access_compat authn_core authz_core socache_shmcb; do
+    [[ "${loaded}" == *" ${m}_module "* ]] && continue
+    so=""
+    for cand in "mod_${m}.so" "mod_${m}_python3.so"; do
+      if [[ -e "/etc/httpd/modules/${cand}" ]]; then
+        so="${cand}"
+        break
+      fi
+    done
+    [[ -n "${so}" ]] || __error "Apache module ${m}_module required by FreeIPA is not installed (exit 80)"
+    missing+=("${m}")
+    lines+=("LoadModule ${m}_module modules/${so}")
+  done
+  if [[ "${#missing[@]}" -eq 0 ]]; then
+    __debug "All Apache modules required by FreeIPA are already loaded"
+    return 0
+  fi
+
+  {
+    printf '# Written by install.sh: modules required by FreeIPA that httpd.conf does not load\n'
+    printf '%s\n' "${lines[@]}"
+  } > "${dropin}"
+  if ! \httpd -t >/dev/null 2>&1; then
+    \rm -f "${dropin}"
+    __error "Loading the Apache modules required by FreeIPA (${missing[*]}) made the configuration invalid; reverted (exit 80)"
+  fi
+  __log "Added ${dropin} to load Apache modules required by FreeIPA: ${missing[*]}"
+}
+
+# Prints the first Apache file (other than mod_ssl's ssl.conf) that defines an enabled virtual host on port 443
+__httpd_foreign_ssl_vhost() {
+  local conf="/etc/httpd/conf.d/ssl.conf" f
+  [[ -d /etc/httpd ]] || return 1
+  while IFS= read -r f; do
+    [[ "${f}" == "${conf}" ]] && continue
+    if \grep -vE '^[[:space:]]*#' "${f}" 2>/dev/null \
+      | \grep -qiE '^[[:space:]]*<VirtualHost[^>]*:443([[:space:]>]|$)'; then
+      printf '%s\n' "${f}"
+      return 0
+    fi
+  done < <(\find /etc/httpd -type f -name '*.conf' 2>/dev/null || true)
+  return 1
+}
+
 # FreeIPA configures TLS by editing directives inside mod_ssl's default
 # <VirtualHost _default_:443>. On a host whose ssl.conf was emptied or has no
 # vhost, those edits land outside any vhost, SSLEngine is never enabled and
@@ -997,8 +1200,12 @@ __ensure_stock_ssl_conf() {
     return 0
   fi
 
-  \command -v rpm2cpio >/dev/null 2>&1 && \command -v cpio >/dev/null 2>&1 \
-    || __error "rpm2cpio and cpio are required to restore ${conf} (exit 77)"
+  # FreeIPA cannot own 443 next to an administrator's vhost there; the preflight refuses that case
+  __httpd_foreign_ssl_vhost >/dev/null && return 0
+
+  if ! \command -v rpm2cpio >/dev/null 2>&1 || ! \command -v cpio >/dev/null 2>&1; then
+    __error "rpm2cpio and cpio are required to restore ${conf} (exit 77)"
+  fi
   tmp="$(\mktemp -d)"
   ( cd "${tmp}" && \dnf download -q "${pkg}" >/dev/null 2>&1 ) \
     || { \rm -rf "${tmp}"; __error "Could not download ${pkg} to restore ${conf} (exit 77)"; }
@@ -1102,7 +1309,7 @@ __verify_freeipa_http() {
     fi
   done
 
-  response="$(\curl --silent --show-error --insecure --max-time 15 --output /dev/null --write-out '%{http_code} %{redirect_url}' \
+  response="$(\curl -q --silent --show-error --insecure --max-time 15 --output /dev/null --write-out '%{http_code} %{redirect_url}' \
     --resolve "${FREEIPA_FQDN}:80:127.0.0.1" "http://${FREEIPA_FQDN}/ipa/ui" 2>/dev/null)" \
     || __error "Could not verify FreeIPA HTTP to HTTPS redirect"
   status="${response%% *}"
@@ -1238,7 +1445,7 @@ __install_docker() {
     *debian*|*ubuntu*)
       \apt-get install -y ca-certificates curl gnupg
       \mkdir -p /etc/apt/keyrings
-      \curl -fsSL "https://download.docker.com/linux/${INSTALL_DISTRO}/gpg" | \gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+      \curl -q -fsSL "https://download.docker.com/linux/${INSTALL_DISTRO}/gpg" | \gpg --dearmor -o /etc/apt/keyrings/docker.gpg
       \chmod a+r /etc/apt/keyrings/docker.gpg
       local arch codename
       arch="$(\dpkg --print-architecture)"
@@ -1636,7 +1843,7 @@ __kc_call() {
   out="$(\mktemp)"
   local -a args=( -q -LSs --max-time 60 -X "${method}" -D "${hdr}" -o "${out}" -w '%{http_code}' -H "Authorization: Bearer ${token}" )
   [[ -n "${body}" ]] && args+=( -H "Content-Type: application/json" -d "${body}" )
-  code="$(\curl "${args[@]}" "http://172.17.0.1:${FREEIPA_KEYCLOAK_PORT}${path}")" || code="000"
+  code="$(\curl -q "${args[@]}" "http://172.17.0.1:${FREEIPA_KEYCLOAK_PORT}${path}")" || code="000"
   KC_BODY="$(<"${out}")"
   KC_LOCATION="$(\grep -i -- '^location:' "${hdr}" | \tail -n1 | \tr -d '\r\n' || true)"
   \rm -f "${hdr}" "${out}"
@@ -2040,8 +2247,15 @@ __setup_freeipa_for_mail() {
   INSTALL_MAIL_CERT_PATH="/etc/mail/certs/mail.pem"
   INSTALL_MAIL_KEY_PATH="/etc/mail/certs/mail.key"
 
-  # Mail keeps a FreeIPA-issued certificate, tracked and renewed by certmonger,
-  # regardless of whether Let's Encrypt is configured for Apache HTTPS.
+  # A publicly trusted certificate is used for the public mail ports when one exists (renewed by the certbot
+  # hook, which reloads Postfix and Dovecot); otherwise a FreeIPA-issued certificate tracked by certmonger.
+  if [[ "${INSTALL_USE_LETSENCRYPT}" == "true" ]]; then
+    INSTALL_MAIL_CERT_PATH="${INSTALL_FULLCHAIN_PATH}"
+    INSTALL_MAIL_KEY_PATH="${INSTALL_KEY_PATH}"
+    __log "Mail TLS uses the Let's Encrypt certificate (${INSTALL_MAIL_CERT_PATH})"
+    __log "FreeIPA configured for mail (Postfix/Dovecot) integration"
+    return 0
+  fi
   if ! \getcert list -f "${INSTALL_MAIL_CERT_PATH}" >/dev/null 2>&1; then
     if [[ -e "${INSTALL_MAIL_CERT_PATH}" || -e "${INSTALL_MAIL_KEY_PATH}" ]]; then
       \rm -f "${INSTALL_MAIL_CERT_PATH}" "${INSTALL_MAIL_KEY_PATH}"
@@ -2537,8 +2751,28 @@ __parse_args() {
 
 # ─── Main ────────────────────────────────────────────────────────────────────
 
+# The host's default credential cache may be unusable: krb5.conf.d/kcm_default_ccache selects KCM:, and a
+# bootstrap that disables sssd-kcm.socket makes every kinit/klist/ipa fail with "No KCM server found". All
+# Kerberos work in this script goes through a private file cache instead.
+__use_private_ccache() {
+  INSTALL_CCACHE_DIR="$(\mktemp -d /run/freeipa-install.XXXXXX 2>/dev/null || \mktemp -d)"
+  export KRB5CCNAME="FILE:${INSTALL_CCACHE_DIR}/krb5cc"
+}
+
+# The install runs for many minutes and is often started over SSH. If that terminal goes away, SIGHUP would
+# kill it half way through ipa-server-install. Ignore SIGHUP (inherited by everything started from here) and
+# route output through a relay that keeps draining after the terminal is gone, so writes never fail with
+# EIO/EPIPE under set -e. Nothing is written to a log file: the summary prints credentials.
+__survive_hangup() {
+  trap '' HUP
+  exec > >(\cat; \cat >/dev/null) 2>&1
+}
+
 __main() {
   __parse_args "$@"
+
+  __survive_hangup
+  __use_private_ccache
 
   __log "Starting Full FreeIPA + Keycloak SSO installation"
 
