@@ -148,6 +148,9 @@ __warn() {
 
 __error() {
   printf "${INSTALL_COLOR_RED}[ERROR] %s${INSTALL_COLOR_RESET}\n" "$1" >&2
+  if [[ "$1" =~ \(exit\ ([0-9]+)\)$ ]]; then
+    exit "${BASH_REMATCH[1]}"
+  fi
   exit 1
 }
 

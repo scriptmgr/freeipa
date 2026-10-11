@@ -52,10 +52,17 @@ PPA has been dead since 2014), and openSUSE's `security:idm` OBS project ships
 `freeipa-client` only. `install.sh` errors out early with an explanatory message
 on Debian/Ubuntu/openSUSE rather than attempting a broken install.
 
-Before changing anything, `install.sh` also refuses (exit 78) on a host that has
-`/etc/ipa/default.conf` but no configured FreeIPA server, i.e. an enrolled client
-or an aborted install. Run `ipa-client-install --uninstall` first. Unsupported
+Before changing anything, `install.sh` also checks the host state. A host that is
+already an enrolled IPA client is refused (exit 78, nothing changed; run
+`ipa-client-install --uninstall` first). Remnants of an aborted or failed
+`ipa-server-install` are removed automatically with
+`ipa-server-install --uninstall`, so the script can simply be re-run. Unsupported
 distributions exit 79.
+
+A Let's Encrypt certificate is only used when it covers the server's FQDN, is not
+expired, and its private key matches; otherwise the FreeIPA CA certificate is used.
+`--debug` additionally prints the `ipa-server-install` command line (passwords
+masked), the Apache files rewritten and why a certificate was skipped.
 
 | Family | Package manager |
 |--------|------------------|

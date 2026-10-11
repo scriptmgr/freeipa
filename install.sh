@@ -355,9 +355,19 @@ __preflight_freeipa_state() {
       ;;
   esac
   __freeipa_server_configured && return 0
-  if [[ -f /etc/ipa/default.conf ]]; then
-    __error "/etc/ipa/default.conf exists but no FreeIPA server is configured here (this host is an IPA client, or a previous install was aborted). Nothing was changed. Run 'ipa-client-install --uninstall' or remove the stale configuration, then re-run (exit 78)"
+  [[ -f /etc/ipa/default.conf ]] || return 0
+
+  # An enrolled client records its enrollment under the client sysrestore dir; refuse to touch it
+  if [[ -f /var/lib/ipa-client/sysrestore/sysrestore.state ]] || ! \command -v ipa-server-install >/dev/null 2>&1; then
+    __error "/etc/ipa/default.conf exists but no FreeIPA server is configured here (this host is an IPA client or has foreign IPA state). Nothing was changed. Run 'ipa-client-install --uninstall' or remove the stale configuration, then re-run (exit 78)"
   fi
+
+  # Otherwise this is what an aborted ipa-server-install leaves behind; clear it so the install can be re-run
+  __warn "Found remnants of an aborted FreeIPA server install; removing them with ipa-server-install --uninstall"
+  \ipa-server-install --uninstall --unattended \
+    || __error "Could not clean up the aborted FreeIPA install; see /var/log/ipaserver-uninstall.log (exit 78)"
+  \rm -f /etc/ipa/default.conf
+  __log "Aborted FreeIPA install cleaned up"
 }
 
 __check_requirements() {
@@ -573,8 +583,19 @@ __check_letsencrypt_certs() {
     [[ -f "${cert_dir}/cert.pem" ]] || continue
     [[ -f "${cert_dir}/privkey.pem" ]] || continue
     [[ -f "${cert_dir}/fullchain.pem" ]] || continue
-    \openssl x509 -in "${cert_dir}/cert.pem" -noout -checkhost "${FREEIPA_FQDN}" >/dev/null 2>&1 || continue
+    if ! \openssl x509 -in "${cert_dir}/cert.pem" -noout -checkhost "${FREEIPA_FQDN}" >/dev/null 2>&1; then
+      __debug "Let's Encrypt candidate ${cert_dir##*/}: does not cover ${FREEIPA_FQDN}"
+      continue
+    fi
     cert_name="${cert_dir##*/}"
+    if ! \openssl x509 -in "${cert_dir}/cert.pem" -noout -checkend 0 >/dev/null 2>&1; then
+      __warn "Skipping Let's Encrypt certificate ${cert_name}: expired"
+      continue
+    fi
+    if [[ "$(\openssl x509 -in "${cert_dir}/cert.pem" -noout -pubkey 2>/dev/null || true)" != "$(\openssl pkey -in "${cert_dir}/privkey.pem" -pubout 2>/dev/null || true)" ]]; then
+      __warn "Skipping Let's Encrypt certificate ${cert_name}: private key does not match"
+      continue
+    fi
     # Skip the README file that certbot places in the directory
     [[ "${cert_name}" == "README" ]] && continue
     cert_dirs="${cert_dirs} ${cert_dir}"
@@ -887,6 +908,17 @@ __install_freeipa() {
   fi
 
   __log "Running FreeIPA installation (may take 10–20 minutes)..."
+  if [[ "${FREEIPA_DEBUG}" -eq 1 ]]; then
+    local _arg _shown=""
+    for _arg in "${install_cmd[@]}"; do
+      case "${_arg}" in
+        --admin-password=*) _arg="--admin-password=xxxxx" ;;
+        --ds-password=*) _arg="--ds-password=xxxxx" ;;
+      esac
+      _shown+=" ${_arg}"
+    done
+    __debug "ipa-server-install command:${_shown}"
+  fi
   "${install_cmd[@]}"
 
   # If using Let's Encrypt, wire up the auto-renewal hook
@@ -921,6 +953,7 @@ __fix_httpd_ports() {
   while IFS= read -r f; do
     files+=("${f}")
   done < <(\grep -rlisE --include='*.conf' -- "${re}" /etc/httpd || true)
+  __debug "Apache files with 81/8443 listeners: ${files[*]:-none}"
 
   local rc_before=0 out=""
   if [[ "${#files[@]}" -eq 0 ]]; then
@@ -2526,6 +2559,7 @@ __main() {
     }
   fi
   __log "Selected Keycloak port: ${FREEIPA_KEYCLOAK_PORT}"
+  __debug "Credentials file: ${FREEIPA_CRED_FILE}; compose dir: ${FREEIPA_COMPOSE_DIR}"
 
   __disable_nginx_service
   __install_prerequisites
