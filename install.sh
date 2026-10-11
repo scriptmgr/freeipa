@@ -235,6 +235,10 @@ __warn() {
 
 __error() {
   printf "${INSTALL_COLOR_RED}[ERROR] %s${INSTALL_COLOR_RESET}\n" "$1" >&2
+  # Messages that end in "(exit NN)" promise that status; honor it
+  if [[ "$1" =~ \(exit\ ([0-9]+)\)$ ]]; then
+    exit "${BASH_REMATCH[1]}"
+  fi
   exit 1
 }
 
@@ -328,6 +332,31 @@ __check_root() {
   if [[ "$(\id -u)" -ne 0 ]]; then
     __error "This script must be run as root (exit 77)"
     exit 77
+  fi
+}
+
+# FreeIPA's own definition of "a server is configured here"
+# (ipalib.facts.is_ipa_configured). /etc/ipa/default.conf alone proves nothing:
+# an enrolled client, or the leftovers of an aborted install, have it too.
+__freeipa_server_configured() {
+  if \command -v python3 >/dev/null 2>&1 && python3 -c 'import ipalib.facts' >/dev/null 2>&1; then
+    python3 -c 'import sys; from ipalib import facts; sys.exit(0 if facts.is_ipa_configured() else 1)' >/dev/null 2>&1
+    return
+  fi
+  [[ -s /var/lib/ipa/sysrestore/sysrestore.state ]]
+}
+
+# Refuse, before anything on the host is changed, to run on a machine that has
+# IPA client/stale configuration but no configured FreeIPA server.
+__preflight_freeipa_state() {
+  case "${INSTALL_DISTRO_FAMILY}" in
+    *debian*|*ubuntu*|*suse*)
+      __error "FreeIPA server install is not supported on ${INSTALL_DISTRO}: no freeipa-server package exists upstream for Debian/Ubuntu/openSUSE. Nothing was changed. Use RHEL-family or Fedora for the server role; client.sh supports this distro (exit 79)"
+      ;;
+  esac
+  __freeipa_server_configured && return 0
+  if [[ -f /etc/ipa/default.conf ]]; then
+    __error "/etc/ipa/default.conf exists but no FreeIPA server is configured here (this host is an IPA client, or a previous install was aborted). Nothing was changed. Run 'ipa-client-install --uninstall' or remove the stale configuration, then re-run (exit 78)"
   fi
 }
 
@@ -649,7 +678,7 @@ __configure_dns_settings() {
   # On an idempotent rerun, the installed IPA DNS service already resolves the
   # hostname. Preserve the existing integrated-DNS state instead of treating
   # that successful lookup as evidence that IPA DNS is not in use.
-  if [[ -f "/etc/ipa/default.conf" && -f "/etc/named/ipa-ext.conf" ]]; then
+  if __freeipa_server_configured && [[ -f "/etc/named/ipa-ext.conf" ]]; then
     INSTALL_DNS="true"
     INSTALL_CONFIGURE_REVERSE_ZONE="false"
     INSTALL_USE_AUTO_FORWARDERS="false"
@@ -794,8 +823,8 @@ HOOKEOF
 
 __install_freeipa() {
   # Idempotency guard — skip if FreeIPA is already installed
-  if [[ -f "/etc/ipa/default.conf" ]]; then
-    __log "FreeIPA already installed (/etc/ipa/default.conf exists); skipping ipa-server-install"
+  if __freeipa_server_configured; then
+    __log "FreeIPA server already configured on this host; skipping ipa-server-install"
     # Still load credentials so downstream functions have them
     INSTALL_ADMIN_PASSWORD="$(__load_credential "${FREEIPA_CRED_FILE}" INSTALL_ADMIN_PASSWORD)" || {
       __warn "FreeIPA installed but admin password not found in ${FREEIPA_CRED_FILE}"
@@ -885,7 +914,7 @@ __fix_httpd_ports() {
   local re='^[[:space:]]*Listen[[:space:]]+([^#[:space:]]*:)?(81|8443)([[:space:]]|$)|^[[:space:]]*<VirtualHost[^>]*:(81|8443)>'
   [[ -d /etc/httpd ]] || return 0
   # An installed FreeIPA already owns these ports (its CA holds 8443); nothing to do
-  [[ -f /etc/ipa/default.conf ]] && return 0
+  __freeipa_server_configured && return 0
 
   local -a files=()
   local f
@@ -2484,6 +2513,7 @@ __main() {
   __detect_distro
   __detect_domain
   __check_requirements
+  __preflight_freeipa_state
 
   __migrate_legacy_credential_file "${FREEIPA_CRED_FILE}"
   __migrate_legacy_credential_keys "${FREEIPA_CRED_FILE}"
