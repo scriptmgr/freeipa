@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # shellcheck shell=bash
 # - - - - - - - - - - - - - - - - - - - - - - - - -
-##@Version           :  202608310342-git
+##@Version           :  202610111835-git
 # @@Author           :  Jason Hempstead
 # @@Contact          :  git-admin@casjaysdev.pro
 # @@License          :  MIT or LICENSE.md
@@ -20,7 +20,7 @@
 # - - - - - - - - - - - - - - - - - - - - - - - - -
 # shellcheck disable=SC1001,SC1003,SC2001,SC2003,SC2016,SC2031,SC2034,SC2090,SC2115,SC2120,SC2155,SC2199,SC2229,SC2317,SC2329
 # - - - - - - - - - - - - - - - - - - - - - - - - -
-VERSION="202608310342-git"
+VERSION="202610111835-git"
 # - - - - - - - - - - - - - - - - - - - - - - - - -
 APPNAME="${0##*/}"
 RUN_USER="${SUDO_USER:-$USER}"
@@ -1034,6 +1034,47 @@ __install_freeipa() {
 
 # ─── Apache port normalization ───────────────────────────────────────────────
 
+__fix_freeipa_wsgi_cgi_handler() {
+  [[ -d /etc/httpd/conf.d ]] || return 0
+
+  # Some host bootstrap configs register every .py file as CGI. That overrides
+  # FreeIPA's WSGI mapping and makes Apache try to execute its non-executable
+  # wsgi.py, returning HTTP 500 from /ipa/json. Scope the override to that one
+  # FreeIPA script and load it after the host's other conf.d files.
+  local wsgi_handler_conf="/etc/httpd/conf.d/zz-freeipa-wsgi-handler.conf"
+  local cgi_python=false f
+  while IFS= read -r f; do
+    if \awk '
+      {
+        sub(/[[:space:]]*#.*/, "")
+        if (tolower($1) == "addhandler" && tolower($2) == "cgi-script") {
+          for (i = 3; i <= NF; i++) if ($i == ".py") found = 1
+        }
+      }
+      END { exit !found }
+    ' "${f}"; then
+      cgi_python=true
+      break
+    fi
+  done < <(\find /etc/httpd -type f -name '*.conf' 2>/dev/null || true)
+
+  if [[ "${cgi_python}" == "true" ]]; then
+    if [[ -e "${wsgi_handler_conf}" ]] \
+      && ! \grep -qF -- '# Written by install.sh: preserve FreeIPA WSGI handling when hosts register Python as CGI' "${wsgi_handler_conf}"; then
+      __error "Refusing to overwrite existing Apache config ${wsgi_handler_conf} (exit 80)"
+    fi
+    {
+      printf '# Written by install.sh: preserve FreeIPA WSGI handling when hosts register Python as CGI\n'
+      printf '<Directory "/usr/share/ipa">\n  <Files "wsgi.py">\n    SetHandler wsgi-script\n  </Files>\n</Directory>\n'
+    } > "${wsgi_handler_conf}"
+    __log "Added ${wsgi_handler_conf} to keep FreeIPA wsgi.py under mod_wsgi"
+  elif [[ -f "${wsgi_handler_conf}" ]] \
+    && \grep -qF -- '# Written by install.sh: preserve FreeIPA WSGI handling when hosts register Python as CGI' "${wsgi_handler_conf}"; then
+    \rm -f "${wsgi_handler_conf}"
+    __log "Removed obsolete FreeIPA WSGI handler override"
+  fi
+}
+
 # Some hosts run Apache on 81/8443 behind an nginx that owns 80/443. FreeIPA
 # needs 80/443 for its own Apache, and its CA (Dogtag) binds 8443 itself, so a
 # stock Apache listener on 8443 keeps the CA from starting. Move Listen 81 back
@@ -1046,6 +1087,7 @@ __install_freeipa() {
 __fix_httpd_ports() {
   local re='^[[:space:]]*Listen[[:space:]]+([^#[:space:]]*:)?(81|8443)([[:space:]]|$)|^[[:space:]]*<VirtualHost[^>]*:(81|8443)>'
   [[ -d /etc/httpd ]] || return 0
+  __fix_freeipa_wsgi_cgi_handler
   # An installed FreeIPA already owns these ports (its CA holds 8443); nothing to do
   __freeipa_server_configured && return 0
 
@@ -1852,10 +1894,11 @@ __kc_call() {
   fi
 }
 
-# Run an `ipa service-add`, tolerating only "already exists".
+# Add service principals even when the host resolver cannot see IPA's own DNS zone.
+# Some host bootstrap configurations keep resolv.conf immutable and pointed at an upstream resolver.
 __ipa_service_add() {
   local out
-  if ! out="$(\ipa service-add "$1" 2>&1)"; then
+  if ! out="$(\ipa service-add --force "$1" 2>&1)"; then
     if ! \grep -qi -- 'already exists' <<< "${out}"; then
       __error "ipa service-add $1 failed: ${out}"
     fi
