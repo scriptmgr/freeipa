@@ -380,6 +380,15 @@ __preflight_freeipa_state() {
   __warn "Found remnants of an aborted FreeIPA server install; removing them with ipa-server-install --uninstall"
   \ipa-server-install --uninstall --unattended \
     || __error "Could not clean up the aborted FreeIPA install; see /var/log/ipaserver-uninstall.log (exit 78)"
+  # A Dogtag Tomcat instance can be started by the failed installation after an
+  # earlier uninstall disabled its unit. Stop that exact FreeIPA service before
+  # the CA port preflight; unrelated services on 8443 remain untouched.
+  local pki_service="pki-tomcatd@pki-tomcat.service"
+  if \command -v systemctl >/dev/null 2>&1 && \systemctl is-active --quiet "${pki_service}"; then
+    __warn "Stopping leftover FreeIPA Dogtag service ${pki_service}"
+    \systemctl stop "${pki_service}" \
+      || __error "Could not stop leftover FreeIPA Dogtag service ${pki_service} (exit 78)"
+  fi
   \rm -f /etc/ipa/default.conf
   __log "Aborted FreeIPA install cleaned up"
 }
