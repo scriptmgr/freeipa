@@ -1294,6 +1294,44 @@ __rewrite_httpd_ports() {
     __log "Moved Apache Listen 81 to 80 and disabled Listen 8443 plus the 81/8443 virtual hosts in ${f} (backup: ${f}.pre-freeipa)"
   done
 
+  # Bootstrap configurations can declare the same legacy listener in several
+  # included files. Rewriting each Listen 81 independently would then leave
+  # duplicate Listen 80 directives, which makes Apache refuse to start.
+  local -a all_conf_files=()
+  while IFS= read -r f; do
+    all_conf_files+=("${f}")
+  done < <(\find /etc/httpd -type f -name '*.conf' -print 2>/dev/null || true)
+  if ((${#all_conf_files[@]} > 0)); then
+    for f in "${all_conf_files[@]}"; do
+      : > "${f}.freeipa-tmp" || __error "Could not prepare Apache config for listener normalization: ${f}"
+    done
+    \awk '
+      FNR == 1 {
+        if (output != "") close(output)
+        output = FILENAME ".freeipa-tmp"
+      }
+      /^[[:space:]]*Listen[[:space:]]/ && tolower($2) ~ /(^|:)80$/ {
+        key = tolower($2 " " $3)
+        if (seen[key]++) {
+          sub(/^[[:space:]]*/, "")
+          print "# freeipa-disabled: duplicate listener " $0 > output
+          next
+        }
+      }
+      { print > output }
+      END { if (output != "") close(output) }
+    ' "${all_conf_files[@]}" || __error "Could not normalize duplicate Apache port 80 listeners"
+    for f in "${all_conf_files[@]}"; do
+      if ! \cmp -s "${f}" "${f}.freeipa-tmp"; then
+        [[ -e "${f}.pre-freeipa" ]] || \cp -p "${f}" "${f}.pre-freeipa"
+        \mv -f "${f}.freeipa-tmp" "${f}"
+        __log "Disabled duplicate Apache port 80 listener in ${f} (backup: ${f}.pre-freeipa)"
+      else
+        \rm -f "${f}.freeipa-tmp"
+      fi
+    done
+  fi
+
   if \grep -rqisE --include='*.conf' -- "${re}" /etc/httpd; then
     __error "Apache still has a 81/8443 listener after moving ports (exit 74)"
   fi
@@ -1474,7 +1512,16 @@ __derive_ldap_base_dn() {
 
 __install_docker() {
   if \command -v docker >/dev/null 2>&1; then
-    __log "Docker already installed; skipping"
+    __log "Docker already installed; checking daemon availability"
+    if \command -v systemctl >/dev/null 2>&1; then
+      \systemctl enable docker >/dev/null 2>&1 \
+        || __error "Docker is installed but docker.service could not be enabled"
+      \systemctl start docker >/dev/null 2>&1 \
+        || __error "Docker is installed but docker.service could not be started; check 'systemctl status docker'"
+    fi
+    \docker info >/dev/null 2>&1 \
+      || __error "Docker is installed but its daemon is unavailable; check 'systemctl status docker'"
+    __log "Docker daemon is available"
     return 0
   fi
 
