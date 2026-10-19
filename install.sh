@@ -1095,10 +1095,12 @@ __fix_freeipa_wsgi_cgi_handler() {
 # the configuration still parses instead of trusting the edit.
 __fix_httpd_ports() {
   local re='^[[:space:]]*Listen[[:space:]]+([^#[:space:]]*:)?(81|8443)([[:space:]]|$)|^[[:space:]]*<VirtualHost[^>]*:(81|8443)>'
-  [[ -d /etc/httpd ]] || return 0
   __fix_freeipa_wsgi_cgi_handler
   # An installed FreeIPA already owns these ports (its CA holds 8443); nothing to do
   __freeipa_server_configured && return 0
+
+  __ensure_httpd_config
+  [[ -d /etc/httpd ]] || return 0
 
   local -a files=()
   local f
@@ -1137,6 +1139,30 @@ __fix_httpd_ports() {
   done
 }
 
+# Bootstrap tools may remove /etc/httpd while leaving its RPM installed. FreeIPA
+# writes its own vhosts during setup, but httpd still needs the packaged main
+# config and module snippets to load them. Reinstalling httpd-core restores
+# missing package files while RPM preserves locally modified configs.
+__ensure_httpd_config() {
+  [[ -s /etc/httpd/conf/httpd.conf ]] && return 0
+  if ! \command -v dnf >/dev/null 2>&1 || ! \rpm -q httpd-core >/dev/null 2>&1; then
+    __error "Apache's main config /etc/httpd/conf/httpd.conf is missing and httpd-core cannot be restored (exit 77)"
+  fi
+  local -a packages=()
+  local pkg
+  for pkg in httpd httpd-core mod_ssl; do
+    \rpm -q "${pkg}" >/dev/null 2>&1 && packages+=("${pkg}")
+  done
+  while IFS= read -r pkg; do
+    [[ -n "${pkg}" ]] && packages+=("${pkg}")
+  done < <(\rpm -qa '*mod_wsgi*' 2>/dev/null | \sort -u)
+  __log "Apache's main config is missing; restoring packaged Apache config files (${packages[*]})"
+  \dnf reinstall -y "${packages[@]}" >/dev/null \
+    || __error "Could not restore Apache's packaged configuration files (${packages[*]}) (exit 77)"
+  [[ -s /etc/httpd/conf/httpd.conf ]] \
+    || __error "httpd-core reinstall did not restore /etc/httpd/conf/httpd.conf (exit 77)"
+}
+
 # FreeIPA's ipa.conf uses directives from several Apache modules. Hosts whose
 # httpd.conf lists modules inline and does not include conf.modules.d (with the
 # packaged module configs emptied) never load mod_auth_gssapi and friends, so
@@ -1166,7 +1192,20 @@ __ensure_httpd_modules() {
 
   local test_out
   if ! test_out="$(\httpd -t 2>&1)"; then
-    if [[ "${test_out}" == *"Cannot load modules/mod_wsgi_python3.so"* \
+    if [[ "${test_out}" == *"Invalid command 'WSGIDaemonProcess'"* \
+      && -e /etc/httpd/modules/mod_wsgi.so && -d /etc/httpd/conf.modules.d ]]; then
+      local wsgi_fix="/etc/httpd/conf.modules.d/00-freeipa-wsgi.conf"
+      if [[ -e "${wsgi_fix}" ]] \
+        && ! \grep -qF -- '# Written by install.sh: load mod_wsgi when bootstrap removed its package config' "${wsgi_fix}"; then
+        __error "Refusing to overwrite existing Apache config ${wsgi_fix} (exit 80)"
+      fi
+      {
+        printf '# Written by install.sh: load mod_wsgi when bootstrap removed its package config\n'
+        printf 'LoadModule wsgi_module modules/mod_wsgi.so\n'
+      } > "${wsgi_fix}"
+      test_out="$(\httpd -t 2>&1)" || __error "Apache configuration is invalid after restoring mod_wsgi: ${test_out} (exit 80)"
+      __log "Added ${wsgi_fix}: the mod_wsgi package config was missing"
+    elif [[ "${test_out}" == *"Cannot load modules/mod_wsgi_python3.so"* \
       && -e /etc/httpd/modules/mod_wsgi.so && -d /etc/httpd/conf.modules.d ]]; then
       local wsgi_fix="/etc/httpd/conf.modules.d/00-freeipa-wsgi.conf"
       printf '# Written by install.sh: the packaged module config references a mod_wsgi_python3.so that does not exist\nLoadModule wsgi_module modules/mod_wsgi.so\n' > "${wsgi_fix}"
@@ -2858,6 +2897,21 @@ __use_private_ccache() {
   export KRB5CCNAME="FILE:${INSTALL_CCACHE_DIR}/krb5cc"
 }
 
+# If Kerberos selects KCM by default, keep the credential cache usable after
+# installation even when a bootstrap script disabled its socket unit.
+__restore_default_kcm() {
+  local config="/etc/krb5.conf.d/kcm_default_ccache"
+  [[ -r "${config}" ]] || return 0
+  \grep -Eq '^[[:space:]]*default_ccache_name[[:space:]]*=[[:space:]]*KCM:' "${config}" || return 0
+  \command -v systemctl >/dev/null 2>&1 \
+    || __error "Kerberos defaults to KCM but systemctl is unavailable to start sssd-kcm.socket (exit 77)"
+  \systemctl unmask sssd-kcm.socket >/dev/null 2>&1 \
+    || __error "Could not unmask sssd-kcm.socket required by the configured KCM credential cache (exit 77)"
+  \systemctl enable --now sssd-kcm.socket >/dev/null \
+    || __error "Could not enable sssd-kcm.socket required by the configured KCM credential cache (exit 77)"
+  __log "Enabled sssd-kcm.socket for the configured KCM Kerberos credential cache"
+}
+
 # The install runs for many minutes and is often started over SSH. If that terminal goes away, SIGHUP would
 # kill it half way through ipa-server-install. Ignore SIGHUP (inherited by everything started from here) and
 # route output through a relay that keeps draining after the terminal is gone, so writes never fail with
@@ -2876,6 +2930,7 @@ __main() {
   __log "Starting Full FreeIPA + Keycloak SSO installation"
 
   __check_root
+  __restore_default_kcm
   __detect_distro
   __detect_domain
   __check_requirements
