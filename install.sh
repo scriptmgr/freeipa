@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # shellcheck shell=bash
 # - - - - - - - - - - - - - - - - - - - - - - - - -
-##@Version           :  202610290802-git
+##@Version           :  202610290851-git
 # @@Author           :  Jason Hempstead
 # @@Contact          :  git-admin@casjaysdev.pro
 # @@License          :  MIT or LICENSE.md
@@ -20,7 +20,7 @@
 # - - - - - - - - - - - - - - - - - - - - - - - - -
 # shellcheck disable=SC1001,SC1003,SC2001,SC2003,SC2016,SC2031,SC2034,SC2090,SC2115,SC2120,SC2155,SC2199,SC2229,SC2317,SC2329
 # - - - - - - - - - - - - - - - - - - - - - - - - -
-VERSION="202610290802-git"
+VERSION="202610290851-git"
 # - - - - - - - - - - - - - - - - - - - - - - - - -
 APPNAME="${0##*/}"
 RUN_USER="${SUDO_USER:-$USER}"
@@ -866,8 +866,16 @@ if [ -f "${CHAIN_PATH}" ]; then
   cp "${CHAIN_PATH}" "${TRUST_DIR}/chain.pem"
   python3 - "${CHAIN_PATH}" "${TRUST_DIR}/root.pem" <<'PYEOF' || true
 import re, sys
+import warnings
 from cryptography import x509
 from cryptography.hazmat.primitives import serialization
+from cryptography.utils import CryptographyDeprecationWarning
+
+warnings.filterwarnings(
+    'ignore',
+    message="Parsed a serial number which wasn't positive",
+    category=CryptographyDeprecationWarning,
+)
 
 def load_all(path):
     data = open(path, 'rb').read().decode('ascii', 'ignore')
@@ -2716,6 +2724,8 @@ __configure_dovecot() {
     local marker_end="# --- scriptmgr-freeipa mail block (end) ---"
     local mail_config=/etc/dovecot/conf.d/99-scriptmgr-freeipa.conf
     local introspection_url=""
+
+    \mkdir -p /etc/dovecot/conf.d
 
     # Dovecot 2.4 uses inline LDAP filters and named OAuth2 settings. Remove
     # the previous managed block and Fedora's inline system-user defaults so
