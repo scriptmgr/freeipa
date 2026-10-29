@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # shellcheck shell=bash
 # - - - - - - - - - - - - - - - - - - - - - - - - -
-##@Version           :  202610111835-git
+##@Version           :  202610290802-git
 # @@Author           :  Jason Hempstead
 # @@Contact          :  git-admin@casjaysdev.pro
 # @@License          :  MIT or LICENSE.md
@@ -20,7 +20,7 @@
 # - - - - - - - - - - - - - - - - - - - - - - - - -
 # shellcheck disable=SC1001,SC1003,SC2001,SC2003,SC2016,SC2031,SC2034,SC2090,SC2115,SC2120,SC2155,SC2199,SC2229,SC2317,SC2329
 # - - - - - - - - - - - - - - - - - - - - - - - - -
-VERSION="202610111835-git"
+VERSION="202610290802-git"
 # - - - - - - - - - - - - - - - - - - - - - - - - -
 APPNAME="${0##*/}"
 RUN_USER="${SUDO_USER:-$USER}"
@@ -64,7 +64,7 @@ INSTALL_CERT_PATH=""
 INSTALL_KEY_PATH=""
 INSTALL_CHAIN_PATH=""
 INSTALL_FULLCHAIN_PATH=""
-INSTALL_ADMIN_USERNAME="administrator"
+INSTALL_ADMIN_USERNAME="${INSTALL_ADMIN_USERNAME:-}"
 INSTALL_ADMIN_PASSWORD=""
 INSTALL_DM_PASSWORD=""
 FREEIPA_DEBUG="${FREEIPA_DEBUG:-0}"
@@ -271,6 +271,7 @@ __help() {
   printf '  FREEIPA_DOMAIN           Override auto-detected domain\n'
   printf '  FREEIPA_REALM            Override auto-detected Kerberos realm\n'
   printf '  FREEIPA_CRED_FILE        Credentials file path (default: /etc/ipa/creds.conf)\n'
+  printf '  INSTALL_ADMIN_USERNAME   Additional FreeIPA admin login (default: administrator)\n'
   printf '  FREEIPA_DEBUG            Enable debug output when set to 1 (same as --debug)\n'
   printf '  FREEIPA_KEYCLOAK_PORT    Override Keycloak port (default: random in 62000-64999)\n'
   printf '  FREEIPA_KEYCLOAK_REALM   Override Keycloak realm (default: domain name)\n'
@@ -525,6 +526,15 @@ __install_packages() {
       fi
       __log "Installing FreeIPA packages via ${pkg_mgr}..."
       "${pkg_mgr}" update -y
+      if [[ "${INSTALL_DISTRO_VERSION%%.*}" == "8" ]] \
+        && "${pkg_mgr}" module list idm --all 2>/dev/null \
+          | \awk '$1 == "idm" && $2 == "DL1" { found=1 } END { exit !found }'; then
+        # On RHEL 8, FreeIPA and dependencies such as softhsm are shipped in
+        # the idm:DL1 AppStream module. Enable the stream before installing
+        # package names directly so DNF does not filter their dependencies.
+        __log "Enabling the RHEL 8 FreeIPA module stream (idm:DL1)..."
+        "${pkg_mgr}" module enable -y idm:DL1
+      fi
       __install_ipa_packages "${pkg_mgr}" ipa-server ipa-server-dns ipa-server-trust-ad bind-utils chrony openldap-clients
       ;;
 
@@ -844,6 +854,8 @@ openssl verify -untrusted "${CERT_PATH}" "${LEAF_PATH}" >/dev/null 2>&1 || exit 
 cred() { sed -n "s/^$1=//p" "${CRED_FILE}" | tail -n1; }
 DM_PASS="$(cred INSTALL_DM_PASSWORD)"
 ADMIN_PASS="$(cred INSTALL_ADMIN_PASSWORD)"
+ADMIN_USER="$(cred INSTALL_ADMIN_USERNAME)"
+[ -n "${ADMIN_USER}" ] || ADMIN_USER=admin
 rc=0
 
 # Make IPA trust the issuing chain so ipa-server-certinstall can validate it and IPA clients, sssd,
@@ -882,7 +894,7 @@ PYEOF
   CCACHE="$(mktemp)"
   KRB5CCNAME="FILE:${CCACHE}"
   export KRB5CCNAME
-  if printf '%s\n' "${ADMIN_PASS}" | kinit admin >/dev/null 2>&1; then
+  if printf '%s\n' "${ADMIN_PASS}" | kinit "${ADMIN_USER}" >/dev/null 2>&1; then
     for f in "${TRUST_DIR}/root.pem" "${TRUST_DIR}/chain.pem"; do
       [ -s "${f}" ] || continue
       if ! out="$(ipa-cacert-manage install -t C,, "${f}" 2>&1)"; then
@@ -892,7 +904,7 @@ PYEOF
     ipa-certupdate >/dev/null 2>&1 || rc=1
     kdestroy >/dev/null 2>&1 || true
   else
-    echo "kinit admin failed" >&2
+    echo "kinit ${ADMIN_USER} failed" >&2
     rc=1
   fi
   rm -rf "${TRUST_DIR}"
@@ -928,6 +940,51 @@ HOOKEOF
 
 # ─── FreeIPA installation ────────────────────────────────────────────────────
 
+__ensure_freeipa_admin() {
+  [[ -n "${INSTALL_ADMIN_PASSWORD}" ]] \
+    || __error "FreeIPA admin password is unavailable; cannot configure ${INSTALL_ADMIN_USERNAME}"
+
+  __save_credential "${FREEIPA_CRED_FILE}" INSTALL_ADMIN_USERNAME "${INSTALL_ADMIN_USERNAME}"
+
+  if [[ "${INSTALL_ADMIN_USERNAME}" == "admin" ]]; then
+    __log "Using FreeIPA's built-in admin account"
+    return 0
+  fi
+
+  __log "Ensuring FreeIPA administrator account ${INSTALL_ADMIN_USERNAME} uses the built-in admin password..."
+  printf '%s\n' "${INSTALL_ADMIN_PASSWORD}" | \kinit "admin@${FREEIPA_REALM}"
+
+  # FreeIPA's built-in admin account cannot be renamed. Create a familiar
+  # additional login, then grant it the same full privileges through admins.
+  if \ipa user-show "${INSTALL_ADMIN_USERNAME}" >/dev/null 2>&1; then
+    printf '%s\n%s\n' "${INSTALL_ADMIN_PASSWORD}" "${INSTALL_ADMIN_PASSWORD}" \
+      | \ipa passwd "${INSTALL_ADMIN_USERNAME}"
+  else
+    printf '%s\n%s\n' "${INSTALL_ADMIN_PASSWORD}" "${INSTALL_ADMIN_PASSWORD}" \
+      | \ipa user-add "${INSTALL_ADMIN_USERNAME}" \
+        --first=Administrator --last=Account --password
+  fi
+
+  # A password reset by an IPA admin normally requires the user to change it
+  # at first login. This account intentionally shares the bootstrap password,
+  # so set a distant expiration to keep non-interactive installer logins usable.
+  \ipa user-mod "${INSTALL_ADMIN_USERNAME}" --password-expiration=2099-12-31T23:59:59Z
+
+  local admin_dn="" group_info="" base_dn="" part
+  local IFS='.'
+  for part in ${FREEIPA_DOMAIN}; do
+    base_dn="${base_dn},dc=${part}"
+  done
+  base_dn="${base_dn#,}"
+  admin_dn="uid=${INSTALL_ADMIN_USERNAME},cn=users,cn=accounts,${base_dn}"
+  group_info="$(\ipa group-show admins --all --raw)"
+  if ! \grep -Fq -- "member: ${admin_dn}" <<< "${group_info}"; then
+    \ipa group-add-member admins "--users=${INSTALL_ADMIN_USERNAME}"
+  fi
+
+  __log "FreeIPA administrator account ${INSTALL_ADMIN_USERNAME} is configured"
+}
+
 # FreeIPA needs python3-mod_wsgi (the system Python). A Python-version-specific mod_wsgi from another repo
 # (python3.11-mod_wsgi ...) ships the same files and cannot coexist with it in one Apache process, so
 # the transaction conflicts. Remove only that package, say so, and retry once.
@@ -961,6 +1018,7 @@ __install_freeipa() {
     INSTALL_DM_PASSWORD="$(__load_credential "${FREEIPA_CRED_FILE}" INSTALL_DM_PASSWORD)" || {
       __warn "FreeIPA installed but DM password not found in ${FREEIPA_CRED_FILE}"
     }
+    __ensure_freeipa_admin
     if [[ "${INSTALL_USE_LETSENCRYPT}" == "true" ]]; then
       # Nginx may have owned ports 80/443 and kept Apache stopped on an existing host.
       # Start and verify FreeIPA's HTTP endpoint before certinstall calls its HTTPS API.
@@ -1031,6 +1089,8 @@ __install_freeipa() {
     __debug "ipa-server-install command:${_shown}"
   fi
   "${install_cmd[@]}"
+
+  __ensure_freeipa_admin
 
   # If using Let's Encrypt, wire up the auto-renewal hook
   if [[ "${INSTALL_USE_LETSENCRYPT}" == "true" ]]; then
@@ -1576,7 +1636,12 @@ __install_docker() {
         *)      repo_distro="rhel"   ;;
       esac
       \dnf install -y dnf-plugins-core
-      \dnf config-manager --add-repo "https://download.docker.com/linux/${repo_distro}/docker-ce.repo"
+      local docker_repo_url="https://download.docker.com/linux/${repo_distro}/docker-ce.repo"
+      if \dnf --version 2>&1 | \grep -qi 'dnf5'; then
+        \dnf config-manager addrepo --from-repofile="${docker_repo_url}"
+      else
+        \dnf config-manager --add-repo "${docker_repo_url}"
+      fi
       \dnf install -y docker-ce docker-ce-cli containerd.io docker-compose-plugin
       ;;
 
@@ -1665,7 +1730,7 @@ __setup_freeipa_for_keycloak() {
   \mkdir -p "${FREEIPA_KEYCLOAK_CONFIG_DIR}"
 
   # Obtain a Kerberos ticket for the admin user
-  printf '%s\n' "${INSTALL_ADMIN_PASSWORD}" | \kinit "admin@${FREEIPA_REALM}"
+  printf '%s\n' "${INSTALL_ADMIN_PASSWORD}" | \kinit "${INSTALL_ADMIN_USERNAME}@${FREEIPA_REALM}"
 
   # Create temp dir before mktemp to ensure parent exists
   \mkdir -p "${TMPDIR:-/tmp}/scriptmgr"
@@ -2055,11 +2120,10 @@ __configure_keycloak() {
         usernameLDAPAttribute: ["uid"],
         rdnLDAPAttribute: ["uid"],
         uuidLDAPAttribute: ["ipaUniqueID"],
-        # FreeIPA user entries (including the built-in admin account) carry
-        # person/posixaccount/inetuser/krbprincipalaux, NOT inetOrgPerson or
-        # organizationalPerson — filtering on those classes matches zero
-        # FreeIPA users, so LDAP sync silently imports nobody.
-        userObjectClasses: ["person, posixaccount"],
+        # FreeIPA active user entries include inetOrgPerson and
+        # organizationalPerson; use those standard person classes in the
+        # Keycloak LDAP provider search filter.
+        userObjectClasses: ["inetOrgPerson, organizationalPerson"],
         connectionUrl: [("ldaps://" + $fqdn + ":636")],
         usersDn: [("cn=users,cn=accounts," + $base_dn)],
         authType: ["simple"],
@@ -2104,10 +2168,17 @@ __configure_keycloak() {
     __error "Could not get the LDAP federation component ID from Keycloak"
   fi
 
-  # Step 3 — Trigger full LDAP sync
+  # Step 3 — Trigger full LDAP sync and retain its result for diagnostics
   __kc_call POST "/admin/realms/${FREEIPA_KEYCLOAK_REALM}/user-storage/${component_id}/sync?action=triggerFullSync"
+  local ldap_sync_result="${KC_BODY}"
 
-  __log "LDAP full sync triggered"
+  local ldap_sync_summary
+  ldap_sync_summary="$(printf '%s\n' "${ldap_sync_result}" | \jq -c '{added: .added, updated: .updated, removed: .removed, failed: .failed, status: .status}' 2>/dev/null || true)"
+  if [[ -n "${ldap_sync_summary}" && "${ldap_sync_summary}" != "null" ]]; then
+    __log "LDAP full sync result: ${ldap_sync_summary}"
+  else
+    __log "LDAP full sync result: ${ldap_sync_result}"
+  fi
 
   # Step 4 — Wait for admin user to appear after sync (up to 60 s)
   # Refresh token — previous one may be stale after sync wait
@@ -2120,15 +2191,17 @@ __configure_keycloak() {
       token="$(__keycloak_admin_token)"
     fi
     local _users_resp
-    _users_resp="$(\curl -q -LSs --max-time 10 \
-      "${kc_url}/admin/realms/${FREEIPA_KEYCLOAK_REALM}/users?username=admin&exact=true" \
+    _users_resp="$(\curl -q -LSs --max-time 10 -G \
+      --data-urlencode "username=${INSTALL_ADMIN_USERNAME}" \
+      --data-urlencode "exact=true" \
+      "${kc_url}/admin/realms/${FREEIPA_KEYCLOAK_REALM}/users" \
       -H "Authorization: Bearer ${token}" 2>/dev/null)"
     admin_user_id="$(printf '%s\n' "${_users_resp}" | \jq -r 'if type == "array" then .[0].id // empty else empty end' 2>/dev/null || true)"
     attempt=$(( attempt + 1 ))
   done
 
   if [[ -z "${admin_user_id}" || "${admin_user_id}" == "null" ]]; then
-    __error "Admin user did not appear in Keycloak after the LDAP sync"
+    __error "FreeIPA user ${INSTALL_ADMIN_USERNAME} did not appear in Keycloak after LDAP sync; result: ${ldap_sync_result}"
   fi
 
   # Step 5 — Assign realm-admin role to admin user
@@ -2186,10 +2259,25 @@ __configure_keycloak_mail_client() {
   local token
   token="$(__keycloak_admin_token)"
 
+  local dovecot_version oauth_client_auth_method
+  dovecot_version="$(\dovecot --version | \awk '{print $1}')"
+  oauth_client_auth_method="client_secret_post"
+  # Dovecot 2.3.21 changed Keycloak introspection credential handling; URL userinfo
+  # supplies Basic auth on 2.3.21+ and 2.4, while older 2.3 releases use POST fields.
+  if [[ "${dovecot_version}" == 2.4.* ]] \
+    || [[ "$(printf '%s\n' 2.3.21 "${dovecot_version}" | \sort -V | \head -n1)" == 2.3.21 ]]; then
+    oauth_client_auth_method="client_secret_basic"
+  fi
+
   INSTALL_MAIL_KEYCLOAK_SECRET="$(__load_credential "${FREEIPA_CRED_FILE}" INSTALL_MAIL_KEYCLOAK_SECRET)" || {
-    INSTALL_MAIL_KEYCLOAK_SECRET="$(__random_password 32)"
+    INSTALL_MAIL_KEYCLOAK_SECRET="$(\openssl rand -hex 24)"
     __save_credential "${FREEIPA_CRED_FILE}" INSTALL_MAIL_KEYCLOAK_SECRET "${INSTALL_MAIL_KEYCLOAK_SECRET}"
   }
+  if [[ ! "${INSTALL_MAIL_KEYCLOAK_SECRET}" =~ ^[A-Za-z0-9._~-]+$ ]]; then
+    INSTALL_MAIL_KEYCLOAK_SECRET="$(\openssl rand -hex 24)"
+    __save_credential "${FREEIPA_CRED_FILE}" INSTALL_MAIL_KEYCLOAK_SECRET "${INSTALL_MAIL_KEYCLOAK_SECRET}"
+    __log "Rotated the Dovecot Keycloak client secret to a URL-safe value"
+  fi
 
   local existing_client_id
   existing_client_id="$(\curl -q -LSs --max-time 10 \
@@ -2200,6 +2288,7 @@ __configure_keycloak_mail_client() {
   client_body="$(\jq -n \
     --arg cid "${FREEIPA_MAIL_KEYCLOAK_CLIENT_ID}" \
     --arg secret "${INSTALL_MAIL_KEYCLOAK_SECRET}" \
+    --arg auth_method "${oauth_client_auth_method}" \
     '{
       clientId: $cid,
       enabled: true,
@@ -2209,6 +2298,9 @@ __configure_keycloak_mail_client() {
       directAccessGrantsEnabled: true,
       serviceAccountsEnabled: true,
       secret: $secret,
+      attributes: {
+        "client.secret.authentication.allowed.method": $auth_method
+      },
       protocolMappers: [{
         name: "dovecot-audience",
         protocol: "openid-connect",
@@ -2335,7 +2427,7 @@ __setup_freeipa_for_mail() {
   }
 
   # Obtain a Kerberos ticket for the admin user
-  printf '%s\n' "${INSTALL_ADMIN_PASSWORD}" | \kinit "admin@${FREEIPA_REALM}"
+  printf '%s\n' "${INSTALL_ADMIN_PASSWORD}" | \kinit "${INSTALL_ADMIN_USERNAME}@${FREEIPA_REALM}"
 
   \mkdir -p "${TMPDIR:-/tmp}/scriptmgr"
   INSTALL_LDIF_TMP="$(\mktemp "${TMPDIR:-/tmp}/scriptmgr/freeipa-mail-XXXXXX.ldif")"
@@ -2616,6 +2708,110 @@ __allow_dovecot_keycloak_selinux() {
 __configure_dovecot() {
   __log "Configuring Dovecot..."
 
+  local dovecot_version
+  dovecot_version="$(dovecot --version | \awk '{print $1}')"
+
+  if [[ "${dovecot_version}" == 2.4.* ]]; then
+    local marker_begin="# --- scriptmgr-freeipa mail block (begin) ---"
+    local marker_end="# --- scriptmgr-freeipa mail block (end) ---"
+    local mail_config=/etc/dovecot/conf.d/99-scriptmgr-freeipa.conf
+    local introspection_url=""
+
+    # Dovecot 2.4 uses inline LDAP filters and named OAuth2 settings. Remove
+    # the previous managed block and Fedora's inline system-user defaults so
+    # the configured FreeIPA-first fallback chain is the only one active.
+    \sed -i "/^${marker_begin}\$/,/^${marker_end}\$/d" /etc/dovecot/dovecot.conf
+    \sed -i '/^passdb pam {$/,/^}$/d; /^userdb passwd {$/,/^}$/d' \
+      /etc/dovecot/dovecot.conf
+    if [[ -f /etc/dovecot/conf.d/10-auth.conf ]]; then
+      \sed -i 's/^!include auth-system.conf.ext/#!include auth-system.conf.ext/' \
+        /etc/dovecot/conf.d/10-auth.conf
+    fi
+    \rm -f /etc/dovecot/dovecot-ldap.conf.ext /etc/dovecot/dovecot-oauth2.conf.ext
+
+    if [[ "${FREEIPA_MAIL_LOCAL_FALLBACK}" == "true" && ! -f /etc/pam.d/dovecot ]]; then
+      {
+        printf '#%%PAM-1.0\n'
+        printf 'auth    required        pam_unix.so\n'
+        printf 'account required        pam_unix.so\n'
+      } > /etc/pam.d/dovecot
+    fi
+
+    if [[ "${FREEIPA_MAIL_KEYCLOAK_AUTH}" == "true" ]]; then
+      local client_id_encoded client_secret_encoded
+      client_id_encoded="$(printf '%s' "${FREEIPA_MAIL_KEYCLOAK_CLIENT_ID}" | \jq -sRr '@uri')"
+      client_secret_encoded="$(printf '%s' "${INSTALL_MAIL_KEYCLOAK_SECRET}" | \jq -sRr '@uri')"
+      introspection_url="http://${client_id_encoded}:${client_secret_encoded}@172.17.0.1:${FREEIPA_KEYCLOAK_PORT}/realms/${FREEIPA_KEYCLOAK_REALM}/protocol/openid-connect/token/introspect"
+
+      if \command -v getenforce >/dev/null 2>&1 && [[ "$(\getenforce 2>/dev/null)" != "Disabled" ]]; then
+        __allow_dovecot_keycloak_selinux
+      fi
+    fi
+
+    {
+      printf '%s\n' "${marker_begin}"
+      printf 'protocols {\n  imap = yes\n  pop3 = yes\n  lmtp = yes\n}\n'
+      printf 'mail_driver = maildir\n'
+      printf 'mail_home = %s/%%{user | domain}/%%{user | username}\n' "${FREEIPA_MAIL_BASE_DIR}"
+      printf 'mail_path = %s/%%{user | domain}/%%{user | username}\n' "${FREEIPA_MAIL_BASE_DIR}"
+      printf 'auth_allow_cleartext = no\n'
+      printf 'auth_mechanisms {\n  plain = yes\n  login = yes\n'
+      if [[ "${FREEIPA_MAIL_KEYCLOAK_AUTH}" == "true" ]]; then
+        printf '  oauthbearer = yes\n  xoauth2 = yes\n'
+      fi
+      printf '}\n'
+      printf 'ldap_uris = ldaps://%s:636\n' "${FREEIPA_FQDN}"
+      printf 'ldap_auth_dn = uid=mail,cn=sysaccounts,cn=etc,%s\n' "${INSTALL_LDAP_BASE_DN}"
+      printf 'ldap_auth_dn_password = "%s"\n' "${INSTALL_MAIL_LDAP_PASSWORD}"
+      printf 'ldap_base = cn=users,cn=accounts,%s\n' "${INSTALL_LDAP_BASE_DN}"
+      printf 'ssl_client_ca_file = /etc/ipa/ca.crt\n'
+      printf 'passdb ldap {\n'
+      printf '  bind = yes\n'
+      printf '  bind_userdn = uid=%%{user | username},cn=users,cn=accounts,%s\n' "${INSTALL_LDAP_BASE_DN}"
+      printf '  filter = (&(objectClass=posixAccount)(uid=%%{user | username}))\n'
+      printf '  mechanisms_filter {\n    plain = yes\n    login = yes\n  }\n'
+      printf '}\n'
+      printf 'userdb ldap {\n'
+      printf '  filter = (&(objectClass=posixAccount)(uid=%%{user | username}))\n'
+      printf '  fields {\n'
+      printf '    home = %s/%%{user | domain}/%%{user | username}\n' "${FREEIPA_MAIL_BASE_DIR}"
+      printf '    mail_path = %s/%%{user | domain}/%%{user | username}\n' "${FREEIPA_MAIL_BASE_DIR}"
+      printf '    uid = %s\n    gid = %s\n' "${FREEIPA_MAIL_VID}" "${FREEIPA_MAIL_VID}"
+      printf '  }\n}\n'
+      if [[ "${FREEIPA_MAIL_LOCAL_FALLBACK}" == "true" ]]; then
+        printf 'passdb pam {\n  service_name = dovecot\n  mechanisms_filter {\n    plain = yes\n    login = yes\n  }\n}\n'
+        printf 'userdb passwd {\n  fields {\n    mail_path = ~/Maildir\n  }\n}\n'
+      fi
+      if [[ "${FREEIPA_MAIL_KEYCLOAK_AUTH}" == "true" ]]; then
+        printf 'oauth2 {\n'
+        printf '  introspection_mode = post\n'
+        printf '  introspection_url = %s\n' "${introspection_url}"
+        printf '  username_attribute = email\n'
+        printf '  active_attribute = active\n'
+        printf '  active_value = true\n'
+        printf '  force_introspection = yes\n'
+        printf '}\n'
+      fi
+      printf 'ssl = required\n'
+      printf 'ssl_server {\n  cert_file = %s\n  key_file = %s\n}\n' \
+        "${INSTALL_MAIL_CERT_PATH}" "${INSTALL_MAIL_KEY_PATH}"
+      printf 'service lmtp {\n  unix_listener /var/spool/postfix/private/dovecot-lmtp {\n    mode = 0600\n    user = postfix\n    group = postfix\n  }\n}\n'
+      printf 'service auth {\n  unix_listener /var/spool/postfix/private/auth {\n    mode = 0666\n    user = postfix\n    group = postfix\n  }\n}\n'
+      printf '%s\n' "${marker_end}"
+    } > "${mail_config}"
+    \chown root:dovecot "${mail_config}"
+    \chmod 640 "${mail_config}"
+
+    \systemctl enable dovecot
+    \systemctl restart dovecot
+    __log "Dovecot ${dovecot_version} configured"
+    return 0
+  fi
+
+  # Remove the 2.4 include when running an older Dovecot version, since it
+  # contains settings that the 2.3 parser does not recognize.
+  \rm -f /etc/dovecot/conf.d/99-scriptmgr-freeipa.conf
+
   # Disable the distro-default system passdb/userdb include — our own block
   # below adds the local Unix fallback explicitly (via pam/passwd) instead,
   # so FreeIPA LDAP stays authoritative and tried first
@@ -2673,11 +2869,21 @@ __configure_dovecot() {
   if [[ "${FREEIPA_MAIL_KEYCLOAK_AUTH}" == "true" ]]; then
     auth_mechanisms+=" oauthbearer xoauth2"
     {
-      printf 'introspection_url = http://172.17.0.1:%s/realms/%s/protocol/openid-connect/token/introspect\n' \
-        "${FREEIPA_KEYCLOAK_PORT}" "${FREEIPA_KEYCLOAK_REALM}"
+      if [[ "${dovecot_version}" == 2.4.* ]] \
+        || [[ "$(printf '%s\n' 2.3.21 "${dovecot_version}" | \sort -V | \head -n1)" == 2.3.21 ]]; then
+        local client_id_encoded client_secret_encoded
+        client_id_encoded="$(printf '%s' "${FREEIPA_MAIL_KEYCLOAK_CLIENT_ID}" | \jq -sRr '@uri')"
+        client_secret_encoded="$(printf '%s' "${INSTALL_MAIL_KEYCLOAK_SECRET}" | \jq -sRr '@uri')"
+        printf 'introspection_url = http://%s:%s@172.17.0.1:%s/realms/%s/protocol/openid-connect/token/introspect\n' \
+          "${client_id_encoded}" "${client_secret_encoded}" \
+          "${FREEIPA_KEYCLOAK_PORT}" "${FREEIPA_KEYCLOAK_REALM}"
+      else
+        printf 'introspection_url = http://172.17.0.1:%s/realms/%s/protocol/openid-connect/token/introspect\n' \
+          "${FREEIPA_KEYCLOAK_PORT}" "${FREEIPA_KEYCLOAK_REALM}"
+        printf 'client_id = %s\n' "${FREEIPA_MAIL_KEYCLOAK_CLIENT_ID}"
+        printf 'client_secret = %s\n' "${INSTALL_MAIL_KEYCLOAK_SECRET}"
+      fi
       printf 'introspection_mode = post\n'
-      printf 'client_id = %s\n' "${FREEIPA_MAIL_KEYCLOAK_CLIENT_ID}"
-      printf 'client_secret = %s\n' "${INSTALL_MAIL_KEYCLOAK_SECRET}"
       # 'email' not 'preferred_username': every other passdb (LDAP, PAM) and
       # this stack's documented login convention use the full user@domain
       # address. Keycloak's preferred_username claim has no domain, so
@@ -2743,7 +2949,7 @@ __display_summary() {
   printf 'Domain:                    %s\n' "${FREEIPA_DOMAIN}"
   printf 'Realm:                     %s\n' "${FREEIPA_REALM}"
   printf 'Web ports:                 HTTP 80 → HTTPS 443\n'
-  printf 'Admin username:            admin\n'
+  printf 'FreeIPA admin username:     %s\n' "${INSTALL_ADMIN_USERNAME}"
   printf 'Admin password:            (saved to %s)\n' "${FREEIPA_CRED_FILE}"
   printf 'Directory Manager pass:    (saved to %s)\n' "${FREEIPA_CRED_FILE}"
   if [[ "${INSTALL_DNS}" == "true" ]]; then
@@ -2788,7 +2994,7 @@ __display_summary() {
   fi
 
   printf 'Kerberos:\n'
-  printf '  kinit admin   — get Kerberos ticket for admin\n'
+  printf '  kinit %s   — get Kerberos ticket for the configured FreeIPA admin\n' "${INSTALL_ADMIN_USERNAME}"
   printf '  klist         — list active tickets\n'
   printf '  kdestroy      — destroy tickets\n\n'
 
@@ -2939,6 +3145,11 @@ __main() {
 
   __migrate_legacy_credential_file "${FREEIPA_CRED_FILE}"
   __migrate_legacy_credential_keys "${FREEIPA_CRED_FILE}"
+
+  if [[ -z "${INSTALL_ADMIN_USERNAME}" ]]; then
+    INSTALL_ADMIN_USERNAME="$(__load_credential "${FREEIPA_CRED_FILE}" INSTALL_ADMIN_USERNAME)" \
+      || INSTALL_ADMIN_USERNAME="administrator"
+  fi
 
   # A caller-supplied FREEIPA_KEYCLOAK_PORT wins over its saved credential.
   if [[ -z "${FREEIPA_KEYCLOAK_PORT}" ]]; then
