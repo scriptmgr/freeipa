@@ -369,7 +369,7 @@ __check_root() {
 __freeipa_server_configured() {
   if \command -v python3 >/dev/null 2>&1 && python3 -c 'import ipalib.facts' >/dev/null 2>&1; then
     python3 -c 'import sys; from ipalib import facts; sys.exit(0 if facts.is_ipa_configured() else 1)' >/dev/null 2>&1
-    return
+    return "$?"
   fi
   [[ -s /var/lib/ipa/sysrestore/sysrestore.state ]]
 }
@@ -379,14 +379,24 @@ __freeipa_server_configured() {
 __preflight_freeipa_state() {
   case "${INSTALL_DISTRO_FAMILY}" in
     *debian*|*ubuntu*|*suse*)
-      __error "FreeIPA server install is not supported on ${INSTALL_DISTRO}: no freeipa-server package exists upstream for Debian/Ubuntu/openSUSE. Nothing was changed. Use RHEL-family or Fedora for the server role; client.sh supports this distro (exit 79)"
+      local unsupported_preflight_msg
+      unsupported_preflight_msg="FreeIPA server install is not supported on ${INSTALL_DISTRO}:"
+      unsupported_preflight_msg+=" no freeipa-server package exists upstream for Debian/Ubuntu/openSUSE."
+      unsupported_preflight_msg+=" Nothing was changed. Use RHEL-family or Fedora for the server role;"
+      unsupported_preflight_msg+=" client.sh supports this distro (exit 79)"
+      __error "${unsupported_preflight_msg}"
       ;;
   esac
   __freeipa_server_configured && return 0
 
   local foreign
   if foreign="$(__httpd_foreign_ssl_vhost)"; then
-    __error "An HTTPS virtual host on port 443 is already defined in ${foreign}; FreeIPA needs port 443 for its web UI. Nothing was changed. Move that virtual host to another port (for example 8443) or disable it, then re-run (exit 81)"
+    local vhost_msg
+    vhost_msg="An HTTPS virtual host on port 443 is already defined in ${foreign};"
+    vhost_msg+=" FreeIPA needs port 443 for its web UI. Nothing was changed."
+    vhost_msg+=" Move that virtual host to another port (for example 8443) or disable it,"
+    vhost_msg+=" then re-run (exit 81)"
+    __error "${vhost_msg}"
   fi
 
   [[ -f /etc/ipa/default.conf ]] || return 0
@@ -399,7 +409,12 @@ __preflight_freeipa_state() {
   done
   if ! \command -v ipa-server-install >/dev/null 2>&1 \
     || { [[ -f /var/lib/ipa-client/sysrestore/sysrestore.state ]] && [[ "${has_server_remnants}" -eq 0 ]]; }; then
-    __error "/etc/ipa/default.conf exists but no FreeIPA server is configured here (this host is an IPA client or has foreign IPA state). Nothing was changed. Run 'ipa-client-install --uninstall' or remove the stale configuration, then re-run (exit 78)"
+    local stale_msg
+    stale_msg="/etc/ipa/default.conf exists but no FreeIPA server is configured here"
+    stale_msg+=" (this host is an IPA client or has foreign IPA state). Nothing was changed."
+    stale_msg+=" Run 'ipa-client-install --uninstall' or remove the stale configuration,"
+    stale_msg+=" then re-run (exit 78)"
+    __error "${stale_msg}"
   fi
 
   # What remains is an aborted ipa-server-install; clear it so the install can be re-run
@@ -930,7 +945,7 @@ PYEOF
     for f in "${TRUST_DIR}/root.pem" "${TRUST_DIR}/chain.pem"; do
       [ -s "${f}" ] || continue
       if ! out="$(ipa-cacert-manage install -t C,, "${f}" 2>&1)"; then
-        printf '%s\n' "${out}" | grep -qi 'already' || { printf '%s\n' "${out}" >&2; rc=1; }
+        printf '%s\n' "${out}" | grep -qi -- 'already' || { printf '%s\n' "${out}" >&2; rc=1; }
       fi
     done
     ipa-certupdate >/dev/null 2>&1 || rc=1
@@ -1027,7 +1042,7 @@ __install_ipa_packages() {
     return 0
   fi
   local alt
-  alt="$(\rpm -qa 2>/dev/null | \grep -E '^python3\.[0-9]+-mod_wsgi-' || true)"
+  alt="$(\rpm -qa 2>/dev/null | \grep -E -- '^python3\.[0-9]+-mod_wsgi-' || true)"
   if [[ -z "${alt}" ]]; then
     return 1
   fi
@@ -1307,7 +1322,10 @@ __ensure_httpd_modules() {
     elif [[ "${test_out}" == *"Cannot load modules/mod_wsgi_python3.so"* \
       && -e /etc/httpd/modules/mod_wsgi.so && -d /etc/httpd/conf.modules.d ]]; then
       local wsgi_fix="/etc/httpd/conf.modules.d/00-freeipa-wsgi.conf"
-      printf '# Written by install.sh: the packaged module config references a mod_wsgi_python3.so that does not exist\nLoadModule wsgi_module modules/mod_wsgi.so\n' > "${wsgi_fix}"
+      {
+        printf '# Written by install.sh: the packaged module config references a mod_wsgi_python3.so that does not exist\n'
+        printf 'LoadModule wsgi_module modules/mod_wsgi.so\n'
+      } > "${wsgi_fix}"
       # Only the dangling reference has to be gone; anything else is reported by the checks below
       if [[ "$(\httpd -t 2>&1 || true)" != *"mod_wsgi_python3.so"* ]]; then
         __log "Added ${wsgi_fix}: the packaged mod_wsgi config references a file that does not exist"
@@ -1367,8 +1385,8 @@ __httpd_foreign_ssl_vhost() {
   [[ -d /etc/httpd ]] || return 1
   while IFS= read -r f; do
     [[ "${f}" == "${conf}" ]] && continue
-    if \grep -vE '^[[:space:]]*#' "${f}" 2>/dev/null \
-      | \grep -qiE '^[[:space:]]*<VirtualHost[^>]*:443([[:space:]>]|$)'; then
+    if \grep -vE -- '^[[:space:]]*#' "${f}" 2>/dev/null \
+      | \grep -qiE -- '^[[:space:]]*<VirtualHost[^>]*:443([[:space:]>]|$)'; then
       printf '%s\n' "${f}"
       return 0
     fi
@@ -1385,7 +1403,7 @@ __ensure_stock_ssl_conf() {
   [[ -d /etc/httpd/conf.d ]] || return 0
   \command -v rpm >/dev/null 2>&1 || return 0
   pkg="$(\rpm -q mod_ssl 2>/dev/null)" || return 0
-  if \grep -qiE '^[[:space:]]*<VirtualHost' "${conf}" 2>/dev/null; then
+  if \grep -qiE -- '^[[:space:]]*<VirtualHost' "${conf}" 2>/dev/null; then
     return 0
   fi
 
@@ -1675,7 +1693,7 @@ __install_docker() {
       esac
       \dnf install -y dnf-plugins-core
       local docker_repo_url="https://download.docker.com/linux/${repo_distro}/docker-ce.repo"
-      if \dnf --version 2>&1 | \grep -qi 'dnf5'; then
+      if \dnf --version 2>&1 | \grep -qi -- 'dnf5'; then
         \dnf config-manager addrepo --from-repofile="${docker_repo_url}"
       else
         \dnf config-manager --add-repo "${docker_repo_url}"
@@ -2784,7 +2802,8 @@ __configure_dovecot() {
       local client_id_encoded client_secret_encoded
       client_id_encoded="$(printf '%s' "${FREEIPA_MAIL_KEYCLOAK_CLIENT_ID}" | \jq -sRr '@uri')"
       client_secret_encoded="$(printf '%s' "${INSTALL_MAIL_KEYCLOAK_SECRET}" | \jq -sRr '@uri')"
-      introspection_url="http://${client_id_encoded}:${client_secret_encoded}@172.17.0.1:${FREEIPA_KEYCLOAK_PORT}/realms/${FREEIPA_KEYCLOAK_REALM}/protocol/openid-connect/token/introspect"
+      introspection_url="http://${client_id_encoded}:${client_secret_encoded}@172.17.0.1:${FREEIPA_KEYCLOAK_PORT}"
+      introspection_url+="/realms/${FREEIPA_KEYCLOAK_REALM}/protocol/openid-connect/token/introspect"
 
       if \command -v getenforce >/dev/null 2>&1 && [[ "$(\getenforce 2>/dev/null)" != "Disabled" ]]; then
         __allow_dovecot_keycloak_selinux
@@ -3152,7 +3171,7 @@ __use_private_ccache() {
 __restore_default_kcm() {
   local config="/etc/krb5.conf.d/kcm_default_ccache"
   [[ -r "${config}" ]] || return 0
-  \grep -Eq '^[[:space:]]*default_ccache_name[[:space:]]*=[[:space:]]*KCM:' "${config}" || return 0
+  \grep -Eq -- '^[[:space:]]*default_ccache_name[[:space:]]*=[[:space:]]*KCM:' "${config}" || return 0
   \command -v systemctl >/dev/null 2>&1 \
     || __error "Kerberos defaults to KCM but systemctl is unavailable to start sssd-kcm.socket (exit 77)"
   \systemctl unmask sssd-kcm.socket >/dev/null 2>&1 \
