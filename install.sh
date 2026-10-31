@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # shellcheck shell=bash
 # - - - - - - - - - - - - - - - - - - - - - - - - -
-##@Version           :  202610290851-git
+##@Version           :  202610312230-git
 # @@Author           :  Jason Hempstead
 # @@Contact          :  git-admin@casjaysdev.pro
 # @@License          :  MIT or LICENSE.md
@@ -10,7 +10,7 @@
 # @@Created          :  Thursday, May 22, 2026 14:29 UTC
 # @@File             :  install.sh
 # @@Description      :  Full FreeIPA + Keycloak SSO bootstrap script, distro-agnostic
-# @@Changelog        :  Reverse-proxy Keycloak under /kc via Apache mod_rewrite
+# @@Changelog        :  Add admins sudo rule, Keycloak admins/users group mirror, retire shadowing local admin account
 # @@TODO             :  None
 # @@Other            :
 # @@Resource         :  https://www.freeipa.org/page/Documentation
@@ -20,7 +20,7 @@
 # - - - - - - - - - - - - - - - - - - - - - - - - -
 # shellcheck disable=SC1001,SC1003,SC2001,SC2003,SC2016,SC2031,SC2034,SC2090,SC2115,SC2120,SC2155,SC2199,SC2229,SC2317,SC2329
 # - - - - - - - - - - - - - - - - - - - - - - - - -
-VERSION="202610290851-git"
+VERSION="202610312230-git"
 # - - - - - - - - - - - - - - - - - - - - - - - - -
 APPNAME="${0##*/}"
 RUN_USER="${SUDO_USER:-$USER}"
@@ -987,6 +987,44 @@ HOOKEOF
 
 # ─── FreeIPA installation ────────────────────────────────────────────────────
 
+# A local account named like the FreeIPA administrator shadows it: nsswitch
+# lists local files before sss, so on this host the name would resolve to the
+# local UID, ignore the FreeIPA password and never receive the admins group
+# or its sudo rule. FreeIPA cannot adopt a local account, so the local one is
+# renamed to <name>-local instead of being deleted or locked: it keeps its
+# UID, password, files and group memberships (a wheel member stays a sudoer),
+# and its home directory moves with it when it is the conventional /home/<name>.
+__retire_local_admin_account() {
+  local name="${1:?Usage: __retire_local_admin_account <username>}"
+  local retired="${name}-local"
+  local entry uid gid home
+
+  entry="$(\awk -F: -v n="${name}" '$1 == n {print; exit}' /etc/passwd)"
+  [[ -n "${entry}" ]] || return 0
+
+  IFS=: read -r _ _ uid gid _ home _ <<< "${entry}"
+  if [[ "${uid}" -eq 0 ]]; then
+    __error "Local account ${name} is UID 0 and would shadow the FreeIPA administrator; set INSTALL_ADMIN_USERNAME to another name"
+  fi
+  if \awk -F: -v n="${retired}" '$1 == n {found = 1} END {exit !found}' /etc/passwd; then
+    __error "Local account ${name} conflicts with the FreeIPA administrator, but ${retired} already exists; resolve it manually"
+  fi
+
+  __warn "Local account ${name} (uid ${uid}) would shadow the FreeIPA administrator ${name}; renaming it to ${retired}"
+  local -a usermod_args=( -l "${retired}" )
+  if [[ "${home}" == "/home/${name}" && ! -e "/home/${retired}" ]]; then
+    usermod_args+=( -d "/home/${retired}" -m )
+  fi
+  \usermod "${usermod_args[@]}" "${name}" || __error "Could not rename local account ${name} to ${retired}; stop its running processes and re-run"
+
+  # usermod -l leaves the same-named primary group behind; rename it only when it is this account's own group
+  if \awk -F: -v n="${name}" -v g="${gid}" '$1 == n && $3 == g {found = 1} END {exit !found}' /etc/group \
+    && ! \awk -F: -v n="${retired}" '$1 == n {found = 1} END {exit !found}' /etc/group; then
+    \groupmod -n "${retired}" "${name}" || __warn "Could not rename local group ${name}; it may shadow the FreeIPA group of that name"
+  fi
+  __log "Renamed local account ${name} to ${retired}; it keeps its password, UID, files and group memberships"
+}
+
 __ensure_freeipa_admin() {
   [[ -n "${INSTALL_ADMIN_PASSWORD}" ]] \
     || __error "FreeIPA admin password is unavailable; cannot configure ${INSTALL_ADMIN_USERNAME}"
@@ -997,6 +1035,8 @@ __ensure_freeipa_admin() {
     __log "Using FreeIPA's built-in admin account"
     return 0
   fi
+
+  __retire_local_admin_account "${INSTALL_ADMIN_USERNAME}"
 
   __log "Ensuring FreeIPA administrator account ${INSTALL_ADMIN_USERNAME} uses the built-in admin password..."
   printf '%s\n' "${INSTALL_ADMIN_PASSWORD}" | \kinit "admin@${FREEIPA_REALM}"
@@ -1151,6 +1191,47 @@ __install_freeipa() {
   fi
 
   __log "FreeIPA server installation completed"
+}
+
+# Groups mirrored into Keycloak (admins already exists in FreeIPA; users does
+# not), an automember rule that keeps `users` complete, and a sudo rule giving
+# the admins group full sudo on every enrolled host. `users` is non-posix: a
+# posix group of that name would clash with the local GID 100 group on RHEL.
+__configure_freeipa_access() {
+  __log "Configuring FreeIPA groups and sudo access for the admins group..."
+
+  printf '%s\n' "${INSTALL_ADMIN_PASSWORD}" | \kinit "admin@${FREEIPA_REALM}"
+
+  if ! \ipa group-show users >/dev/null 2>&1; then
+    \ipa group-add users --nonposix --desc="All FreeIPA users (mirrored to Keycloak)" >/dev/null || __error "Could not create the FreeIPA group users"
+  fi
+
+  if ! \ipa automember-show users --type=group >/dev/null 2>&1; then
+    \ipa automember-add users --type=group >/dev/null || __error "Could not create the automember rule for the FreeIPA group users"
+  fi
+  if ! \ipa automember-show users --type=group --all 2>/dev/null | \grep -Fq -- 'uid=.*'; then
+    \ipa automember-add-condition users --type=group --key=uid --inclusive-regex='.*' >/dev/null || __error "Could not add the all-users condition to the users automember rule"
+  fi
+  \ipa automember-rebuild --type=group >/dev/null || __error "Could not rebuild automember membership for the FreeIPA group users"
+
+  local sudo_rule="admins_all"
+  local sudo_desc="Members of admins may run any command on any host"
+  local -a sudo_scope=( --hostcat=all --cmdcat=all --runasusercat=all --runasgroupcat=all )
+  if ! \ipa sudorule-show "${sudo_rule}" >/dev/null 2>&1; then
+    \ipa sudorule-add "${sudo_rule}" --desc="${sudo_desc}" "${sudo_scope[@]}" >/dev/null || __error "Could not create the FreeIPA sudo rule ${sudo_rule}"
+  fi
+  if ! \ipa sudorule-show "${sudo_rule}" --all --raw 2>/dev/null | \grep -Fq -- 'memberuser: cn=admins,'; then
+    \ipa sudorule-add-user "${sudo_rule}" --groups=admins >/dev/null || __error "Could not add the admins group to the FreeIPA sudo rule ${sudo_rule}"
+  fi
+
+  # Clients read sudo rules through SSSD; ipa-client-install enables that by default
+  if ! \grep -Eq -- '^sudoers:.*[[:space:]]sss([[:space:]]|$)' /etc/nsswitch.conf 2>/dev/null; then
+    __warn "/etc/nsswitch.conf has no 'sss' source for sudoers; the ${sudo_rule} rule will not apply on this host until it is added"
+  fi
+
+  \kdestroy 2>/dev/null || true
+
+  __log "FreeIPA group users, its automember rule and sudo rule ${sudo_rule} (admins) are configured"
 }
 
 # - - - - - - - - - - - - - - - - - - - - - - - - -
@@ -2122,6 +2203,69 @@ __ipa_service_add() {
   fi
 }
 
+# ─── Keycloak group mapper ───────────────────────────────────────────────────
+
+# Mirror the FreeIPA groups admins and users into Keycloak, read-only: FreeIPA
+# stays the source of truth and Keycloak can never write group changes back.
+# The filter keeps every other FreeIPA group (ipausers, editors, ...) out.
+# Usage: __configure_keycloak_group_mapper <ldap-component-id>
+__configure_keycloak_group_mapper() {
+  local component_id="${1:?Usage: __configure_keycloak_group_mapper <ldap-component-id>}"
+  local realm_path="/admin/realms/${FREEIPA_KEYCLOAK_REALM}"
+  local mapper_type="org.keycloak.storage.ldap.mappers.LDAPStorageMapper"
+
+  local mapper_body
+  mapper_body="$(\jq -n \
+    --arg parent "${component_id}" \
+    --arg type "${mapper_type}" \
+    --arg groups_dn "cn=groups,cn=accounts,${INSTALL_LDAP_BASE_DN}" \
+    '{
+      name: "freeipa-groups",
+      providerId: "group-ldap-mapper",
+      providerType: $type,
+      parentId: $parent,
+      config: {
+        "groups.dn": [$groups_dn],
+        "group.name.ldap.attribute": ["cn"],
+        "group.object.classes": ["groupOfNames"],
+        "preserve.group.inheritance": ["false"],
+        "ignore.missing.groups": ["true"],
+        "membership.ldap.attribute": ["member"],
+        "membership.attribute.type": ["DN"],
+        "membership.user.ldap.attribute": ["uid"],
+        "groups.ldap.filter": ["(|(cn=admins)(cn=users))"],
+        "mode": ["READ_ONLY"],
+        "user.roles.retrieve.strategy": ["LOAD_GROUPS_BY_MEMBER_ATTRIBUTE"],
+        "mapped.group.attributes": [""],
+        "drop.non.existing.groups.during.sync": ["false"],
+        "groups.path": ["/"]
+      }
+    }')"
+
+  __kc_call GET "${realm_path}/components?parent=${component_id}&type=${mapper_type}&name=freeipa-groups"
+  local mapper_id
+  mapper_id="$(printf '%s\n' "${KC_BODY}" | \jq -r 'if type == "array" then .[0].id // empty else empty end' 2>/dev/null || true)"
+
+  if [[ -n "${mapper_id}" && "${mapper_id}" != "null" ]]; then
+    __kc_call PUT "${realm_path}/components/${mapper_id}" "$(printf '%s\n' "${mapper_body}" | \jq --arg id "${mapper_id}" '. + {id: $id}')"
+    __log "Keycloak group mapper already exists (id: ${mapper_id}); config updated"
+  else
+    __kc_call POST "${realm_path}/components" "${mapper_body}"
+    mapper_id="${KC_LOCATION##*/}"
+    [[ -n "${mapper_id}" ]] || __error "Could not get the group mapper ID from Keycloak"
+    __log "Keycloak group mapper created (id: ${mapper_id})"
+  fi
+
+  __kc_call POST "${realm_path}/user-storage/${component_id}/mappers/${mapper_id}/sync?direction=fedToKeycloak"
+
+  # Read the groups back instead of trusting the sync response
+  __kc_call GET "${realm_path}/groups?first=0&max=100"
+  \jq -e 'map(.name) | (index("admins") != null) and (index("users") != null)' <<< "${KC_BODY}" >/dev/null \
+    || __error "Keycloak groups admins and users did not appear after the group sync: ${KC_BODY:0:300}"
+
+  __log "Keycloak groups admins and users mirror the FreeIPA groups (read-only)"
+}
+
 # ─── Keycloak REST API configuration ─────────────────────────────────────────
 
 __configure_keycloak() {
@@ -2235,6 +2379,9 @@ __configure_keycloak() {
   else
     __log "LDAP full sync result: ${ldap_sync_result}"
   fi
+
+  # Step 3b — Mirror the FreeIPA admins and users groups into Keycloak
+  __configure_keycloak_group_mapper "${component_id}"
 
   # Step 4 — Wait for admin user to appear after sync (up to 60 s)
   # Refresh token — previous one may be stale after sync wait
@@ -3074,6 +3221,8 @@ __display_summary() {
   printf '  Admin pass:     (saved to %s)\n' "${FREEIPA_CRED_FILE}"
   printf '  Realm:          %s\n' "${FREEIPA_KEYCLOAK_REALM}"
   printf '  LDAP sync:      FreeIPA → Keycloak federation active\n'
+  printf '  Groups:         admins, users (read-only mirror of the FreeIPA groups)\n'
+  printf '  Sudo:           FreeIPA admins group (rule admins_all)\n'
   printf '  Kerberos SPNEGO: HTTP/%s@%s\n' "${FREEIPA_FQDN}" "${FREEIPA_REALM}"
   printf '  Docker compose: %s/docker-compose.yml\n' "${FREEIPA_COMPOSE_DIR}"
   printf '  Credentials:    %s\n' "${FREEIPA_CRED_FILE}"
@@ -3234,6 +3383,7 @@ __main() {
   __install_freeipa
   __configure_freeipa_http
   __derive_ldap_base_dn
+  __configure_freeipa_access
   __setup_freeipa_for_keycloak
   __install_keycloak_docker
   __wait_for_keycloak
