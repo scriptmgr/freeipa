@@ -235,6 +235,29 @@ __warn() {
   printf "${INSTALL_COLOR_YELLOW}[WARN] %s${INSTALL_COLOR_RESET}\n" "$1" >&2
 }
 
+# ipa-server-install and ipa-adtrust-install print nothing while ns-slapd stops, which can take about 2 minutes
+# (389-ds-base 2.8, sidgen task). Killing it then aborts the install, so print a heartbeat while they run.
+INSTALL_HEARTBEAT_PID=""
+
+__heartbeat_start() {
+  local what="${1:?Usage: __heartbeat_start <description>}"
+  __heartbeat_stop
+  (
+    while \sleep 60; do
+      __log "Still running ${what}; the directory server can take about 2 minutes to stop, do not interrupt"
+    done
+  ) 2>/dev/null &
+  INSTALL_HEARTBEAT_PID=$!
+  \disown "${INSTALL_HEARTBEAT_PID}" 2>/dev/null || true
+}
+
+__heartbeat_stop() {
+  [[ -n "${INSTALL_HEARTBEAT_PID}" ]] || return 0
+  \pkill -P "${INSTALL_HEARTBEAT_PID}" 2>/dev/null || true
+  \kill "${INSTALL_HEARTBEAT_PID}" 2>/dev/null || true
+  INSTALL_HEARTBEAT_PID=""
+}
+
 __error() {
   printf "${INSTALL_COLOR_RED}[ERROR] %s${INSTALL_COLOR_RESET}\n" "$1" >&2
   # Messages that end in "(exit NN)" promise that status; honor it
@@ -299,6 +322,7 @@ __version() {
 # ─── Cleanup ─────────────────────────────────────────────────────────────────
 
 __cleanup() {
+  __heartbeat_stop
   [[ -n "${INSTALL_LDIF_TMP}" && -f "${INSTALL_LDIF_TMP}" ]] && \rm -f "${INSTALL_LDIF_TMP}" 2>/dev/null || true
   [[ -n "${INSTALL_CCACHE_DIR:-}" && -d "${INSTALL_CCACHE_DIR}" ]] && \rm -rf "${INSTALL_CCACHE_DIR}" 2>/dev/null || true
 }
@@ -1096,7 +1120,13 @@ __install_freeipa() {
     done
     __debug "ipa-server-install command:${_shown}"
   fi
-  "${install_cmd[@]}"
+  __heartbeat_start "ipa-server-install"
+  "${install_cmd[@]}" || {
+    local install_rc=$?
+    __heartbeat_stop
+    return "${install_rc}"
+  }
+  __heartbeat_stop
 
   __ensure_freeipa_admin
 
@@ -2375,10 +2405,13 @@ __configure_ad_trust() {
   # Note: ipa-adtrust-install does not support GSSAPI or stdin password input.
   # The admin password appears in process arguments briefly during execution.
   # This is a known limitation of the tool.
+  __heartbeat_start "ipa-adtrust-install"
   if ! \ipa-adtrust-install -U -a "${INSTALL_ADMIN_PASSWORD}" --add-sids; then
+    __heartbeat_stop
     __warn "ipa-adtrust-install failed — AD trust support was not configured; run it manually if needed"
     return 0
   fi
+  __heartbeat_stop
 
   __log "AD trust support configured"
 }
