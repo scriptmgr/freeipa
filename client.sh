@@ -209,7 +209,7 @@ __help() {
   printf '  this script installs sssd + krb5 instead; unlike Alpine, Arch is glibc-\n'
   printf '  based so getent/id/login all resolve normally, but this host'"'"'s own\n'
   printf '  directory entry/keytab is not registered (no ipa-client-install/ipa-join).\n'
-  printf '  See TODO.AI.md for details.\n'
+  printf '  See README.md for details.\n'
 }
 
 __version() {
@@ -524,14 +524,14 @@ __verify_enrollment() {
 #
 # Alpine has no freeipa-client package, and musl libc cannot load NSS modules,
 # so getent/id/login can never resolve directory-backed users regardless of
-# backend (confirmed against nss-pam-ldapd and sssd — see TODO.AI.md). This
+# backend (confirmed against nss-pam-ldapd and sssd — see README.md). This
 # path installs what actually works: krb5 (kinit) always, and on Alpine edge
 # only, sssd for pam_sss-based PAM authentication (NOT NSS-based lookups).
 
 __install_alpine_client_packages() {
   __warn "Alpine has no freeipa-client package and musl cannot load NSS modules"
   __warn "Directory-integrated identity (getent/id/login) is not possible here"
-  __warn "Installing the best available path — see TODO.AI.md for details"
+  __warn "Installing the best available path — see README.md for details"
 
   \apk update
 

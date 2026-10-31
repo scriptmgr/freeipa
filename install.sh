@@ -1560,9 +1560,9 @@ __verify_freeipa_http() {
 # "/realms/...", "/resources/...", "/js/..." (unaware of "/kc"), those exact
 # top-level paths are proxied through too, unprefixed, so the browser's
 # follow-up requests still land on Keycloak rather than 404 against
-# FreeIPA's own vhost. This path list matches the Keycloak version pinned in
-# __install_keycloak_docker's docker-compose.yml and may need updating on a
-# major Keycloak upgrade.
+# FreeIPA's own vhost. __install_keycloak_docker's docker-compose.yml tracks
+# the latest Keycloak image, so this path list may need updating when a new
+# Keycloak release changes its top-level paths.
 __configure_apache_keycloak_proxy() {
   local apache_conf_dir="" ssl_conf=""
   if [[ -d "/etc/httpd/conf.d" ]]; then
