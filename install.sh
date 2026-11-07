@@ -28,6 +28,9 @@ SET_UID="${UID}"
 SCRIPT_SRC_DIR="${BASH_SOURCE%/*}"
 # - - - - - - - - - - - - - - - - - - - - - - - - -
 set -euo pipefail
+# ipa-server-install refuses to run unless the umask is 022, and a hardened root umask of 077 would also
+# be baked into every file this script writes under /etc; hosts bootstrapped that way hit this
+umask 022
 # - - - - - - - - - - - - - - - - - - - - - - - - -
 # Color output — suppressed when NO_COLOR is set
 INSTALL_COLOR_RED='\e[0;31m'
@@ -2117,9 +2120,9 @@ EOF
 # ─── Wait for Keycloak readiness ─────────────────────────────────────────────
 
 __wait_for_keycloak() {
-  __log "Waiting for Keycloak to become ready (up to 300 s)..."
+  __log "Waiting for Keycloak to become ready (up to 900 s)..."
   local elapsed=0
-  while [[ "${elapsed}" -lt 300 ]]; do
+  while [[ "${elapsed}" -lt 900 ]]; do
     # Use the OIDC discovery document as the readiness probe — it is served only
     # after Keycloak's HTTP servlet is fully initialised and the master realm
     # exists. The /health/ready path returns 404 on the main port in KC 26
@@ -2134,7 +2137,7 @@ __wait_for_keycloak() {
     sleep 10
     elapsed=$(( elapsed + 10 ))
   done
-  __error "Keycloak did not become ready within 300 seconds (exit 69)"
+  __error "Keycloak did not become ready within 900 seconds (exit 69)"
   exit 69
 }
 
