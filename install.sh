@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # shellcheck shell=bash
 # - - - - - - - - - - - - - - - - - - - - - - - - -
-##@Version           :  202610312230-git
+##@Version           :  202611080200-git
 # @@Author           :  Jason Hempstead
 # @@Contact          :  git-admin@casjaysdev.pro
 # @@License          :  MIT or LICENSE.md
@@ -10,7 +10,7 @@
 # @@Created          :  Thursday, May 22, 2026 14:29 UTC
 # @@File             :  install.sh
 # @@Description      :  Full FreeIPA + Keycloak SSO bootstrap script, distro-agnostic
-# @@Changelog        :  Add admins sudo rule, Keycloak admins/users group mirror, retire shadowing local admin account
+# @@Changelog        :  Survive a lost terminal during install, force umask 022, fix admin password expiry
 # @@TODO             :  None
 # @@Other            :
 # @@Resource         :  https://www.freeipa.org/page/Documentation
@@ -20,7 +20,7 @@
 # - - - - - - - - - - - - - - - - - - - - - - - - -
 # shellcheck disable=SC1001,SC1003,SC2001,SC2003,SC2016,SC2031,SC2034,SC2090,SC2115,SC2120,SC2155,SC2199,SC2229,SC2317,SC2329
 # - - - - - - - - - - - - - - - - - - - - - - - - -
-VERSION="202610312230-git"
+VERSION="202611080200-git"
 # - - - - - - - - - - - - - - - - - - - - - - - - -
 APPNAME="${0##*/}"
 RUN_USER="${SUDO_USER:-$USER}"
@@ -1058,7 +1058,9 @@ __ensure_freeipa_admin() {
   # A password reset by an IPA admin normally requires the user to change it
   # at first login. This account intentionally shares the bootstrap password,
   # so set a distant expiration to keep non-interactive installer logins usable.
-  \ipa user-mod "${INSTALL_ADMIN_USERNAME}" --password-expiration=2099-12-31T23:59:59Z
+  # Kerberos stores times in 32 bits: a date past 2038 wraps and every kinit then warns that the password expires
+  # within the hour, so stay below 2038 (the Keycloak sysaccount below uses the same limit).
+  \ipa user-mod "${INSTALL_ADMIN_USERNAME}" --password-expiration=2037-12-31T23:59:59Z
 
   local admin_dn="" group_info="" base_dn="" part
   local IFS='.'
@@ -3337,9 +3339,11 @@ __restore_default_kcm() {
 # kill it half way through ipa-server-install. Ignore SIGHUP (inherited by everything started from here) and
 # route output through a relay that keeps draining after the terminal is gone, so writes never fail with
 # EIO/EPIPE under set -e. Nothing is written to a log file: the summary prints credentials.
+# The first cat dies of SIGPIPE once the terminal is gone; `|| true` keeps the inherited set -e from aborting the
+# relay before the second cat starts draining, which would close the pipe under the running installer.
 __survive_hangup() {
   trap '' HUP
-  exec > >(\cat; \cat >/dev/null) 2>&1
+  exec > >(\cat || true; \cat >/dev/null) 2>&1
 }
 
 __main() {
