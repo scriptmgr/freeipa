@@ -35,7 +35,7 @@ bash install.sh
 8. **Serves FreeIPA directly through Apache** on ports 80 and 443; HTTP requests redirect to HTTPS and the installer verifies both listeners. If `/etc/httpd/conf/httpd.conf` is missing, the installer reinstalls the installed `httpd`, `httpd-core`, `mod_ssl`, and mod_wsgi packages (when present) to restore their packaged Apache configuration files, including the `mod_systemd` config required by `httpd.service`'s `Type=notify`, before FreeIPA setup; it reports an error if the main config cannot be restored. If mod_wsgi's module config is still missing or references a nonexistent module, a separate `LoadModule` fallback is added when the module is present. Hosts that run Apache on ports 81/8443 behind another web server are handled first: `Listen 81` becomes `Listen 80`, duplicate `Listen 80` declarations across included configuration files are disabled, `Listen 8443` and the virtual hosts bound to 81/8443 are disabled (FreeIPA's CA needs 8443, and a leftover vhost on 443 would sit in front of FreeIPA), and a packaged `mod_ssl` `ssl.conf` is restored when the existing one has no virtual host. If the host registers `.py` files as CGI, the installer scopes FreeIPA's `wsgi.py` back to mod_wsgi. Existing Apache files changed for the port adjustment are kept as `<file>.pre-freeipa`.
 9. **Federates Keycloak against FreeIPA LDAP** — creates a `keycloak` LDAP bind account, an `HTTP` Kerberos service principal, and exports a keytab plus the IPA CA certificate
 10. **Deploys Keycloak via Docker Compose** — Postgres + Keycloak, with Kerberos SPNEGO wired to FreeIPA
-11. **Configures the Keycloak realm over its REST API** — creates the realm, the LDAP user federation component, triggers a full sync, mirrors the FreeIPA groups `admins` and `users` into Keycloak as groups of the same names (read-only, FreeIPA stays the source of truth; other FreeIPA groups are not imported), and promotes the admin user to `realm-admin`
+11. **Configures the Keycloak realm over its REST API** — creates the realm, the LDAP user federation component, triggers a full sync, mirrors the FreeIPA groups `admins` and `users` into Keycloak as groups of the same names (read-only, FreeIPA stays the source of truth; other FreeIPA groups are not imported), and grants the `admins` group full administrator roles — `realm-admin` in the new realm and `admin` in the master realm (see [Administrators and users](#administrators-and-users)). Every token also carries a `groups` claim
 12. **Configures AD trust support** (`ipa-adtrust-install --add-sids`), unconditionally — RHEL-family and Fedora only, since no working `freeipa-server` package exists for Debian/Ubuntu/openSUSE (see [Supported distributions](#supported-distributions))
 13. **Installs and configures Postfix and Dovecot** — LDAP-authenticated virtual mailboxes backed by FreeIPA, with one TLS certificate shared by both (the Let's Encrypt certificate when present, otherwise a FreeIPA-issued, certmonger-tracked one). Postfix accepts mail for `FREEIPA_MAIL_DOMAIN` and any `*.FREEIPA_MAIL_DOMAIN` subdomain (via a `regexp:` virtual-domain map — Postfix has no native glob syntax). Dovecot configuration follows the installed version's syntax, including native Dovecot 2.4 settings used by current Fedora packages. Dovecot also supports a Unix/PAM local-account fallback (tried when a user isn't found in LDAP) and Keycloak OAUTHBEARER/XOAUTH2 via token introspection for IMAP/POP3 clients that support it — both on by default, each independently toggleable
 14. Prints an installation summary with access URLs, credential locations, and next steps
@@ -141,6 +141,43 @@ own Keycloak client, and that client needs an **audience mapper** targeting
 `FREEIPA_MAIL_KEYCLOAK_CLIENT_ID` (`dovecot-mail` by default) so the token's
 `aud` claim includes it — Keycloak's introspection endpoint reports tokens
 without a matching audience as inactive.
+
+---
+
+## Administrators and users
+
+FreeIPA is the single place that decides who is an administrator. The `administrator` user and every member of the
+FreeIPA `admins` group are global administrators; members of the `users` group (kept filled automatically with
+every FreeIPA user) are ordinary users.
+
+| | `admins` | `users` |
+|---|---|---|
+| Linux hosts | root through sudo on every enrolled host (rule `admins_all`) | no sudo unless granted |
+| Keycloak | `realm-admin` in the installer's realm and `admin` in the master realm | plain user, no administrative role |
+| Apps (Portainer, ...) | tokens carry `groups: ["admins", ...]`; map `admins` to the app's administrator role | map `users` to the app's regular user role |
+
+Keycloak mirrors the two groups read-only, so membership changes are made in FreeIPA only. The master realm is
+federated too; FreeIPA's built-in `admin` account is not imported there, because Keycloak's own bootstrap `admin`
+already owns that username and stays as the break-glass login. Anyone in `admins` can control every Keycloak
+realm, so keep that group small.
+
+### Sudo for a single user
+
+A user can be given sudo without joining `admins`, so they stay a plain user in Keycloak and in apps:
+
+```bash
+# full sudo, the same rights as admins
+ipa sudorule-add-user admins_all --users=alice
+
+# or a scoped rule
+ipa sudocmd-add /usr/bin/systemctl
+ipa sudorule-add alice_services --hostcat=all
+ipa sudorule-add-allow-command alice_services --sudocmds=/usr/bin/systemctl
+ipa sudorule-add-user alice_services --users=alice
+```
+
+Each host's SSSD refreshes sudo rules every 15 minutes; `systemctl restart sssd` on a host applies a new rule
+immediately. `install.sh` never removes users from `admins_all` on a rerun.
 
 ---
 

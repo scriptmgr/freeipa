@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # shellcheck shell=bash
 # - - - - - - - - - - - - - - - - - - - - - - - - -
-##@Version           :  202611080200-git
+##@Version           :  202611110100-git
 # @@Author           :  Jason Hempstead
 # @@Contact          :  git-admin@casjaysdev.pro
 # @@License          :  MIT or LICENSE.md
@@ -10,7 +10,7 @@
 # @@Created          :  Thursday, May 22, 2026 14:29 UTC
 # @@File             :  install.sh
 # @@Description      :  Full FreeIPA + Keycloak SSO bootstrap script, distro-agnostic
-# @@Changelog        :  Survive a lost terminal during install, force umask 022, fix admin password expiry
+# @@Changelog        :  FreeIPA admins group is global admin (Keycloak realms, groups claim, sudo); DNS detection and sudo refresh fixes
 # @@TODO             :  None
 # @@Other            :
 # @@Resource         :  https://www.freeipa.org/page/Documentation
@@ -20,7 +20,7 @@
 # - - - - - - - - - - - - - - - - - - - - - - - - -
 # shellcheck disable=SC1001,SC1003,SC2001,SC2003,SC2016,SC2031,SC2034,SC2090,SC2115,SC2120,SC2155,SC2199,SC2229,SC2317,SC2329
 # - - - - - - - - - - - - - - - - - - - - - - - - -
-VERSION="202611080200-git"
+VERSION="202611110100-git"
 # - - - - - - - - - - - - - - - - - - - - - - - - -
 APPNAME="${0##*/}"
 RUN_USER="${SUDO_USER:-$USER}"
@@ -74,6 +74,9 @@ FREEIPA_DEBUG="${FREEIPA_DEBUG:-0}"
 # - - - - - - - - - - - - - - - - - - - - - - - - -
 # Keycloak / LDAP globals
 INSTALL_LDAP_BASE_DN=""
+KC_BODY=""
+KC_LOCATION=""
+KC_USER_ID=""
 FREEIPA_KEYCLOAK_PORT="${FREEIPA_KEYCLOAK_PORT:-}"
 FREEIPA_KEYCLOAK_REALM="${FREEIPA_KEYCLOAK_REALM:-}"
 INSTALL_KEYCLOAK_ADMIN_PASSWORD=""
@@ -247,7 +250,7 @@ __heartbeat_start() {
   __heartbeat_stop
   (
     while \sleep 60; do
-      __log "Still running ${what}; the directory server can take about 2 minutes to stop, do not interrupt"
+      __log "Still running ${what}; this can take several minutes, do not interrupt"
     done
   ) 2>/dev/null &
   INSTALL_HEARTBEAT_PID=$!
@@ -778,6 +781,22 @@ __configure_ssl_certs() {
 
 # ─── DNS settings ────────────────────────────────────────────────────────────
 
+# True only when public/upstream DNS really returns an address for the FQDN. nslookup exits 0 on NOERROR/NODATA, so a
+# domain with wildcard MX/TXT records makes every name look resolvable; ask for A/AAAA records and require an answer.
+__fqdn_has_address_record() {
+  local answer
+  answer="$(\dig +short +time=3 +tries=1 A "${FREEIPA_FQDN}." 2>/dev/null || true)"
+  answer+="$(\dig +short +time=3 +tries=1 AAAA "${FREEIPA_FQDN}." 2>/dev/null || true)"
+  [[ -n "${answer}" ]]
+}
+
+# True when the domain is already an authoritative DNS zone served elsewhere (an SOA record exists at its apex).
+# ipa-server-install refuses to create an integrated zone that overlaps one, and an overlapping internal zone
+# would hide every other record of the real zone from clients that use FreeIPA's DNS.
+__dns_zone_served_elsewhere() {
+  [[ -n "$(\dig +short +time=3 +tries=1 SOA "${FREEIPA_DOMAIN}." 2>/dev/null || true)" ]]
+}
+
 __configure_dns_settings() {
   __log "Auto-detecting DNS configuration..."
 
@@ -794,7 +813,18 @@ __configure_dns_settings() {
     return 0
   fi
 
-  if ! \nslookup "${FREEIPA_FQDN}" >/dev/null 2>&1; then
+  if __fqdn_has_address_record; then
+    __log "Hostname is resolvable; integrated DNS not required"
+    INSTALL_DNS="false"
+    INSTALL_USE_AUTO_FORWARDERS="false"
+    INSTALL_CONFIGURE_REVERSE_ZONE="false"
+  elif __dns_zone_served_elsewhere; then
+    __warn "DNS zone ${FREEIPA_DOMAIN} is served by external name servers; skipping integrated DNS (an overlapping zone is refused by FreeIPA)"
+    __warn "Create an A record for ${FREEIPA_FQDN} pointing at this host so clients can resolve it"
+    INSTALL_DNS="false"
+    INSTALL_USE_AUTO_FORWARDERS="false"
+    INSTALL_CONFIGURE_REVERSE_ZONE="false"
+  else
     __log "Hostname not resolvable via DNS; will install integrated DNS server"
     INSTALL_DNS="true"
     INSTALL_CONFIGURE_REVERSE_ZONE="true"
@@ -812,11 +842,6 @@ __configure_dns_settings() {
       __log "No IPv4 DNS forwarders found; integrated DNS will run without forwarders"
     fi
     INSTALL_USE_AUTO_FORWARDERS="false"
-  else
-    __log "Hostname is resolvable; integrated DNS not required"
-    INSTALL_DNS="false"
-    INSTALL_USE_AUTO_FORWARDERS="false"
-    INSTALL_CONFIGURE_REVERSE_ZONE="false"
   fi
 
   if [[ "${INSTALL_DNS}" == "true" ]]; then
@@ -1198,6 +1223,33 @@ __install_freeipa() {
   __log "FreeIPA server installation completed"
 }
 
+# SSSD loads sudo rules once at startup (before the rule above existed, so it caches none) and then only refreshes
+# them every 15 minutes, so administrators could not use sudo for a while after the install. Restarting SSSD makes
+# it fetch the rules immediately; wait until sudo reports them instead of assuming.
+# A local sudoers entry naming the same user (some bootstrap scripts write one) would make `sudo -l` look fine without
+# the FreeIPA rule, so a rule created or changed in this run always restarts SSSD. Usage: __refresh_sssd_sudo_rules <0|1>
+__refresh_sssd_sudo_rules() {
+  local rule_changed="${1:-0}"
+  \command -v sudo >/dev/null 2>&1 || return 0
+  \systemctl is-active --quiet sssd 2>/dev/null || return 0
+  if [[ "${rule_changed}" != "1" ]] && \sudo -l -U "${INSTALL_ADMIN_USERNAME}" 2>/dev/null | \grep -q -- '(ALL'; then
+    return 0
+  fi
+
+  __log "Restarting SSSD so it loads the new sudo rule"
+  \systemctl restart sssd || { __warn "Could not restart sssd; the sudo rule applies after SSSD's next refresh (up to 15 minutes)"; return 0; }
+  local waited=0
+  while [[ "${waited}" -lt 60 ]]; do
+    if \sudo -l -U "${INSTALL_ADMIN_USERNAME}" 2>/dev/null | \grep -q -- '(ALL'; then
+      __log "sudo rule is active for ${INSTALL_ADMIN_USERNAME}"
+      return 0
+    fi
+    sleep 3
+    waited=$(( waited + 3 ))
+  done
+  __warn "SSSD has not loaded the sudo rule yet; it applies after SSSD's next refresh (up to 15 minutes)"
+}
+
 # Groups mirrored into Keycloak (admins already exists in FreeIPA; users does
 # not), an automember rule that keeps `users` complete, and a sudo rule giving
 # the admins group full sudo on every enrolled host. `users` is non-posix: a
@@ -1219,14 +1271,16 @@ __configure_freeipa_access() {
   fi
   \ipa automember-rebuild --type=group >/dev/null || __error "Could not rebuild automember membership for the FreeIPA group users"
 
-  local sudo_rule="admins_all"
+  local sudo_rule="admins_all" sudo_changed=0
   local sudo_desc="Members of admins may run any command on any host"
   local -a sudo_scope=( --hostcat=all --cmdcat=all --runasusercat=all --runasgroupcat=all )
   if ! \ipa sudorule-show "${sudo_rule}" >/dev/null 2>&1; then
     \ipa sudorule-add "${sudo_rule}" --desc="${sudo_desc}" "${sudo_scope[@]}" >/dev/null || __error "Could not create the FreeIPA sudo rule ${sudo_rule}"
+    sudo_changed=1
   fi
   if ! \ipa sudorule-show "${sudo_rule}" --all --raw 2>/dev/null | \grep -Fq -- 'memberuser: cn=admins,'; then
     \ipa sudorule-add-user "${sudo_rule}" --groups=admins >/dev/null || __error "Could not add the admins group to the FreeIPA sudo rule ${sudo_rule}"
+    sudo_changed=1
   fi
 
   # Clients read sudo rules through SSSD; ipa-client-install enables that by default
@@ -1235,6 +1289,8 @@ __configure_freeipa_access() {
   fi
 
   \kdestroy 2>/dev/null || true
+
+  __refresh_sssd_sudo_rules "${sudo_changed}"
 
   __log "FreeIPA group users, its automember rule and sudo rule ${sudo_rule} (admins) are configured"
 }
@@ -2064,7 +2120,9 @@ services:
       # flow in its web UI before any API password grant will succeed —
       # every scripted token request below fails with invalid_user_credentials
       # until that UI step runs. KC_BOOTSTRAP_ADMIN_USERNAME/PASSWORD creates
-      # a normal, immediately usable admin instead.
+      # Keycloak's documented bootstrap admin instead: flagged temporary by design but usable
+      # at once through the API. It stays as the break-glass login; the FreeIPA admins group
+      # holds the permanent administrator roles.
       KC_BOOTSTRAP_ADMIN_USERNAME: admin
       KC_BOOTSTRAP_ADMIN_PASSWORD: "${kc_admin_password_escaped}"
       KC_LOG_LEVEL: INFO
@@ -2210,13 +2268,14 @@ __ipa_service_add() {
 
 # ─── Keycloak group mapper ───────────────────────────────────────────────────
 
-# Mirror the FreeIPA groups admins and users into Keycloak, read-only: FreeIPA
+# Mirror the FreeIPA groups admins and users into a Keycloak realm, read-only: FreeIPA
 # stays the source of truth and Keycloak can never write group changes back.
 # The filter keeps every other FreeIPA group (ipausers, editors, ...) out.
-# Usage: __configure_keycloak_group_mapper <ldap-component-id>
+# Usage: __configure_keycloak_group_mapper <ldap-component-id> <realm>
 __configure_keycloak_group_mapper() {
-  local component_id="${1:?Usage: __configure_keycloak_group_mapper <ldap-component-id>}"
-  local realm_path="/admin/realms/${FREEIPA_KEYCLOAK_REALM}"
+  local component_id="${1:?Usage: __configure_keycloak_group_mapper <ldap-component-id> <realm>}"
+  local realm="${2:?}"
+  local realm_path="/admin/realms/${realm}"
   local mapper_type="org.keycloak.storage.ldap.mappers.LDAPStorageMapper"
 
   local mapper_body
@@ -2253,12 +2312,12 @@ __configure_keycloak_group_mapper() {
 
   if [[ -n "${mapper_id}" && "${mapper_id}" != "null" ]]; then
     __kc_call PUT "${realm_path}/components/${mapper_id}" "$(printf '%s\n' "${mapper_body}" | \jq --arg id "${mapper_id}" '. + {id: $id}')"
-    __log "Keycloak group mapper already exists (id: ${mapper_id}); config updated"
+    __log "Keycloak group mapper in realm ${realm} already exists (id: ${mapper_id}); config updated"
   else
     __kc_call POST "${realm_path}/components" "${mapper_body}"
     mapper_id="${KC_LOCATION##*/}"
     [[ -n "${mapper_id}" ]] || __error "Could not get the group mapper ID from Keycloak"
-    __log "Keycloak group mapper created (id: ${mapper_id})"
+    __log "Keycloak group mapper created in realm ${realm} (id: ${mapper_id})"
   fi
 
   __kc_call POST "${realm_path}/user-storage/${component_id}/mappers/${mapper_id}/sync?direction=fedToKeycloak"
@@ -2266,43 +2325,25 @@ __configure_keycloak_group_mapper() {
   # Read the groups back instead of trusting the sync response
   __kc_call GET "${realm_path}/groups?first=0&max=100"
   \jq -e 'map(.name) | (index("admins") != null) and (index("users") != null)' <<< "${KC_BODY}" >/dev/null \
-    || __error "Keycloak groups admins and users did not appear after the group sync: ${KC_BODY:0:300}"
+    || __error "Keycloak groups admins and users did not appear in realm ${realm} after the group sync: ${KC_BODY:0:300}"
 
-  __log "Keycloak groups admins and users mirror the FreeIPA groups (read-only)"
+  __log "Keycloak groups admins and users mirror the FreeIPA groups in realm ${realm} (read-only)"
 }
 
-# ─── Keycloak REST API configuration ─────────────────────────────────────────
+# ─── Keycloak realm federation and global-admin roles ───────────────────────
 
-__configure_keycloak() {
-  __log "Configuring Keycloak realm and LDAP federation..."
+# Federate FreeIPA into one realm: the LDAP user component (updated in place on reruns), a full user sync and the
+# read-only admins/users group mirror. FreeIPA's built-in admin account is not imported into the master realm, where
+# Keycloak's own bootstrap admin already owns that username and stays as the break-glass login.
+# Usage: __configure_keycloak_federation <realm>
+__configure_keycloak_federation() {
+  local realm="${1:?Usage: __configure_keycloak_federation <realm>}"
+  local user_filter=""
+  [[ "${realm}" == "master" ]] && user_filter="(!(uid=admin))"
 
-  local kc_url="http://172.17.0.1:${FREEIPA_KEYCLOAK_PORT}"
-  local token
-
-  # Step 1 — Create realm (idempotent: skip if realm already exists)
-  token="$(__keycloak_admin_token)"
-  local realm_exists
-  realm_exists="$(\curl -q -LSs --max-time 10 \
-    "${kc_url}/admin/realms/${FREEIPA_KEYCLOAK_REALM}" \
-    -H "Authorization: Bearer ${token}" \
-    2>/dev/null | \jq -r '.realm // empty' 2>/dev/null)"
-
-  if [[ -z "${realm_exists}" ]]; then
-    __kc_call POST "/admin/realms" "$(\jq -n --arg r "${FREEIPA_KEYCLOAK_REALM}" --arg d "${FREEIPA_DOMAIN}" \
-      '{realm: $r, enabled: true, displayName: ("SSO — " + $d), sslRequired: "external", registrationAllowed: false, bruteForceProtected: true}')"
-    __log "Realm ${FREEIPA_KEYCLOAK_REALM} created"
-  else
-    __log "Realm ${FREEIPA_KEYCLOAK_REALM} already exists; skipping creation"
-  fi
-
-  # Step 2 — Create LDAP user federation component (idempotent — check first)
-  token="$(__keycloak_admin_token)"
-
-  # Check if freeipa-ldap component already exists
   local _existing_comp
-  _existing_comp="$(\curl -q -LSs --max-time 10 \
-    "${kc_url}/admin/realms/${FREEIPA_KEYCLOAK_REALM}/components?type=org.keycloak.storage.UserStorageProvider&name=freeipa-ldap" \
-    -H "Authorization: Bearer ${token}" 2>/dev/null | \jq -r 'if type == "array" then .[0].id // empty else empty end' 2>/dev/null || true)"
+  __kc_call GET "/admin/realms/${realm}/components?type=org.keycloak.storage.UserStorageProvider&name=freeipa-ldap"
+  _existing_comp="$(printf '%s\n' "${KC_BODY}" | \jq -r 'if type == "array" then .[0].id // empty else empty end' 2>/dev/null || true)"
 
   local ldap_body
   ldap_body="$(\jq -n \
@@ -2311,11 +2352,12 @@ __configure_keycloak() {
     --arg ldap_pass "${INSTALL_KEYCLOAK_LDAP_PASSWORD}" \
     --arg realm "${FREEIPA_REALM}" \
     --arg keytab "/etc/keycloak/keycloak.keytab" \
+    --arg filter "${user_filter}" \
     '{
       name: "freeipa-ldap",
       providerId: "ldap",
       providerType: "org.keycloak.storage.UserStorageProvider",
-      config: {
+      config: ({
         enabled: ["true"],
         priority: ["0"],
         importEnabled: ["true"],
@@ -2325,9 +2367,6 @@ __configure_keycloak() {
         usernameLDAPAttribute: ["uid"],
         rdnLDAPAttribute: ["uid"],
         uuidLDAPAttribute: ["ipaUniqueID"],
-        # FreeIPA active user entries include inetOrgPerson and
-        # organizationalPerson; use those standard person classes in the
-        # Keycloak LDAP provider search filter.
         userObjectClasses: ["inetOrgPerson, organizationalPerson"],
         connectionUrl: [("ldaps://" + $fqdn + ":636")],
         usersDn: [("cn=users,cn=accounts," + $base_dn)],
@@ -2351,104 +2390,183 @@ __configure_keycloak() {
         batchSizeForSync: ["1000"],
         fullSyncPeriod: ["-1"],
         changedSyncPeriod: ["86400"]
-      }
+      } + (if $filter != "" then {customUserSearchFilter: [$filter]} else {} end))
     }')"
 
-  local ldap_response component_id
+  local component_id
   if [[ -n "${_existing_comp}" && "${_existing_comp}" != "null" ]]; then
     component_id="${_existing_comp}"
-    # Update in place so config drift (e.g. a fixed bind password, a corrected
-    # userObjectClasses filter after a script upgrade) is reconciled on every
-    # re-run instead of being permanently frozen at whatever was first created.
-    __kc_call PUT "/admin/realms/${FREEIPA_KEYCLOAK_REALM}/components/${component_id}" \
-      "$(printf '%s\n' "${ldap_body}" | \jq --arg id "${component_id}" '. + {id: $id}')"
-    __log "LDAP federation component already exists (id: ${component_id}); config updated"
+    # Update in place so config drift (e.g. a fixed bind password, a corrected userObjectClasses filter after a
+    # script upgrade) is reconciled on every re-run instead of being frozen at whatever was first created.
+    __kc_call PUT "/admin/realms/${realm}/components/${component_id}" "$(printf '%s\n' "${ldap_body}" | \jq --arg id "${component_id}" '. + {id: $id}')"
+    __log "LDAP federation component in realm ${realm} already exists (id: ${component_id}); config updated"
   else
-    __kc_call POST "/admin/realms/${FREEIPA_KEYCLOAK_REALM}/components" "${ldap_body}"
+    __kc_call POST "/admin/realms/${realm}/components" "${ldap_body}"
     component_id="${KC_LOCATION##*/}"
-    __log "LDAP federation component created (id: ${component_id})"
+    __log "LDAP federation component created in realm ${realm} (id: ${component_id})"
   fi
+  [[ -n "${component_id}" ]] || __error "Could not get the LDAP federation component ID from Keycloak realm ${realm}"
 
-  if [[ -z "${component_id}" ]]; then
-    __error "Could not get the LDAP federation component ID from Keycloak"
-  fi
-
-  # Step 3 — Trigger full LDAP sync and retain its result for diagnostics
-  __kc_call POST "/admin/realms/${FREEIPA_KEYCLOAK_REALM}/user-storage/${component_id}/sync?action=triggerFullSync"
-  local ldap_sync_result="${KC_BODY}"
-
-  local ldap_sync_summary
-  ldap_sync_summary="$(printf '%s\n' "${ldap_sync_result}" | \jq -c '{added: .added, updated: .updated, removed: .removed, failed: .failed, status: .status}' 2>/dev/null || true)"
-  if [[ -n "${ldap_sync_summary}" && "${ldap_sync_summary}" != "null" ]]; then
-    __log "LDAP full sync result: ${ldap_sync_summary}"
+  # Full user sync, keeping its result for diagnostics
+  __kc_call POST "/admin/realms/${realm}/user-storage/${component_id}/sync?action=triggerFullSync"
+  local sync_summary
+  sync_summary="$(printf '%s\n' "${KC_BODY}" | \jq -c '{added: .added, updated: .updated, removed: .removed, failed: .failed, status: .status}' 2>/dev/null || true)"
+  if [[ -n "${sync_summary}" && "${sync_summary}" != "null" ]]; then
+    __log "LDAP full sync result for realm ${realm}: ${sync_summary}"
   else
-    __log "LDAP full sync result: ${ldap_sync_result}"
+    __log "LDAP full sync result for realm ${realm}: ${KC_BODY}"
+  fi
+  if [[ "$(printf '%s\n' "${KC_BODY}" | \jq -r '.failed // 0' 2>/dev/null || true)" != "0" ]]; then
+    __warn "Keycloak reported failed users in the LDAP sync of realm ${realm}; check the keycloak container log"
   fi
 
-  # Step 3b — Mirror the FreeIPA admins and users groups into Keycloak
-  __configure_keycloak_group_mapper "${component_id}"
+  __configure_keycloak_group_mapper "${component_id}" "${realm}"
+}
 
-  # Step 4 — Wait for admin user to appear after sync (up to 60 s)
-  # Refresh token — previous one may be stale after sync wait
-  token="$(__keycloak_admin_token)"
-  local admin_user_id="" attempt=0
-  while [[ -z "${admin_user_id}" || "${admin_user_id}" == "null" ]] && [[ "${attempt}" -lt 12 ]]; do
+# Wait for a federated user to appear in a realm (up to 60 s); sets KC_USER_ID.
+# Usage: __keycloak_wait_for_user <realm> <username>
+__keycloak_wait_for_user() {
+  local realm="${1:?Usage: __keycloak_wait_for_user <realm> <username>}" username="${2:?}" attempt=0
+  KC_USER_ID=""
+  while [[ -z "${KC_USER_ID}" ]] && [[ "${attempt}" -lt 12 ]]; do
     sleep 5
-    # Refresh token every 3 attempts to avoid 401
-    if [[ $(( attempt % 3 )) -eq 0 ]]; then
-      token="$(__keycloak_admin_token)"
-    fi
-    local _users_resp
-    _users_resp="$(\curl -q -LSs --max-time 10 -G \
-      --data-urlencode "username=${INSTALL_ADMIN_USERNAME}" \
-      --data-urlencode "exact=true" \
-      "${kc_url}/admin/realms/${FREEIPA_KEYCLOAK_REALM}/users" \
-      -H "Authorization: Bearer ${token}" 2>/dev/null)"
-    admin_user_id="$(printf '%s\n' "${_users_resp}" | \jq -r 'if type == "array" then .[0].id // empty else empty end' 2>/dev/null || true)"
+    __kc_call GET "/admin/realms/${realm}/users?username=${username}&exact=true"
+    KC_USER_ID="$(printf '%s\n' "${KC_BODY}" | \jq -r 'if type == "array" then .[0].id // empty else empty end' 2>/dev/null || true)"
     attempt=$(( attempt + 1 ))
   done
+  [[ -n "${KC_USER_ID}" ]] || __error "FreeIPA user ${username} did not appear in Keycloak realm ${realm} after the LDAP sync"
+}
 
-  if [[ -z "${admin_user_id}" || "${admin_user_id}" == "null" ]]; then
-    __error "FreeIPA user ${INSTALL_ADMIN_USERNAME} did not appear in Keycloak after LDAP sync; result: ${ldap_sync_result}"
+# Give a Keycloak group a role, then read the mapping back. A realm role or a client role:
+# Usage: __keycloak_grant_group_role <realm> <group> realm <role>
+#        __keycloak_grant_group_role <realm> <group> client <role> <client-id>
+__keycloak_grant_group_role() {
+  local realm="${1:?}" group="${2:?}" kind="${3:?}" role="${4:?}" client_id="${5:-}"
+  local base="/admin/realms/${realm}" group_id mapping_path client_uuid
+
+  __kc_call GET "${base}/groups?search=${group}&exact=true"
+  group_id="$(printf '%s\n' "${KC_BODY}" | \jq -r --arg g "${group}" 'if type == "array" then (map(select(.name == $g)) | .[0].id // empty) else empty end' 2>/dev/null || true)"
+  [[ -n "${group_id}" ]] || __error "Keycloak group ${group} was not found in realm ${realm}"
+
+  if [[ "${kind}" == "client" ]]; then
+    __kc_call GET "${base}/clients?clientId=${client_id}"
+    client_uuid="$(printf '%s\n' "${KC_BODY}" | \jq -r 'if type == "array" then .[0].id // empty else empty end' 2>/dev/null || true)"
+    [[ -n "${client_uuid}" ]] || __error "Could not find the ${client_id} client in Keycloak realm ${realm}"
+    __kc_call GET "${base}/clients/${client_uuid}/roles/${role}"
+    mapping_path="${base}/groups/${group_id}/role-mappings/clients/${client_uuid}"
+  else
+    __kc_call GET "${base}/roles/${role}"
+    mapping_path="${base}/groups/${group_id}/role-mappings/realm"
+  fi
+  __kc_call POST "${mapping_path}" "$(printf '%s\n' "${KC_BODY}" | \jq -c '[{id: .id, name: .name}]')"
+
+  __kc_call GET "${mapping_path}"
+  \jq -e --arg n "${role}" 'map(.name) | index($n) != null' <<< "${KC_BODY}" >/dev/null \
+    || __error "Role ${role} is not mapped to the Keycloak group ${group} in realm ${realm}"
+  __log "Keycloak group ${group} holds the ${role} role in realm ${realm}"
+}
+
+# Confirm a user really holds a role through the group (effective roles), not just that the mapping exists.
+# Usage: __keycloak_verify_effective_role <realm> <user-id> realm <role> | <realm> <user-id> client <role> <client-id>
+__keycloak_verify_effective_role() {
+  local realm="${1:?}" user_id="${2:?}" kind="${3:?}" role="${4:?}" client_id="${5:-}"
+  local base="/admin/realms/${realm}/users/${user_id}/role-mappings" client_uuid
+  if [[ "${kind}" == "client" ]]; then
+    __kc_call GET "/admin/realms/${realm}/clients?clientId=${client_id}"
+    client_uuid="$(printf '%s\n' "${KC_BODY}" | \jq -r 'if type == "array" then .[0].id // empty else empty end' 2>/dev/null || true)"
+    __kc_call GET "${base}/clients/${client_uuid}/composite"
+  else
+    __kc_call GET "${base}/realm/composite"
+  fi
+  \jq -e --arg n "${role}" 'map(.name) | index($n) != null' <<< "${KC_BODY}" >/dev/null \
+    || __error "The FreeIPA administrator does not hold the ${role} role in Keycloak realm ${realm} through the admins group"
+}
+
+# Add a standard "groups" claim (the user's group names, e.g. admins/users) to every token in a realm. Apps such as
+# Portainer map that claim to their own roles: admins -> administrator, users -> regular user.
+# Usage: __configure_keycloak_groups_claim <realm>
+__configure_keycloak_groups_claim() {
+  local realm="${1:?Usage: __configure_keycloak_groups_claim <realm>}"
+  local base="/admin/realms/${realm}" scope_id scope_body
+
+  __kc_call GET "${base}/client-scopes"
+  scope_id="$(printf '%s\n' "${KC_BODY}" | \jq -r 'map(select(.name == "groups")) | .[0].id // empty' 2>/dev/null || true)"
+  if [[ -z "${scope_id}" ]]; then
+    scope_body="$(\jq -n '{
+      name: "groups",
+      protocol: "openid-connect",
+      description: "FreeIPA group membership (admins, users)",
+      attributes: {"include.in.token.scope": "true", "display.on.consent.screen": "false"},
+      protocolMappers: [{
+        name: "groups",
+        protocol: "openid-connect",
+        protocolMapper: "oidc-group-membership-mapper",
+        config: {
+          "claim.name": "groups",
+          "full.path": "false",
+          "id.token.claim": "true",
+          "access.token.claim": "true",
+          "userinfo.token.claim": "true"
+        }
+      }]
+    }')"
+    __kc_call POST "${base}/client-scopes" "${scope_body}"
+    scope_id="${KC_LOCATION##*/}"
+    [[ -n "${scope_id}" ]] || __error "Could not get the groups client scope ID from Keycloak realm ${realm}"
+    __log "Keycloak groups claim scope created in realm ${realm}"
   fi
 
-  # Step 5 — Assign realm-admin role to admin user
+  # Default scope: every client created later carries the claim without further setup
+  __kc_call PUT "${base}/default-default-client-scopes/${scope_id}"
+  __kc_call GET "${base}/default-default-client-scopes"
+  \jq -e 'map(.name) | index("groups") != null' <<< "${KC_BODY}" >/dev/null \
+    || __error "The groups client scope is not a default scope in Keycloak realm ${realm}"
+  __log "Keycloak realm ${realm}: tokens carry a groups claim by default"
+}
 
-  # Refresh token before role assignment
+# ─── Keycloak REST API configuration ─────────────────────────────────────────
+
+__configure_keycloak() {
+  __log "Configuring Keycloak realm and LDAP federation..."
+
+  local kc_url="http://172.17.0.1:${FREEIPA_KEYCLOAK_PORT}"
+  local token
+
+  # Create the realm (idempotent: skip if it already exists)
   token="$(__keycloak_admin_token)"
+  local realm_exists
+  realm_exists="$(\curl -q -LSs --max-time 10 \
+    "${kc_url}/admin/realms/${FREEIPA_KEYCLOAK_REALM}" \
+    -H "Authorization: Bearer ${token}" \
+    2>/dev/null | \jq -r '.realm // empty' 2>/dev/null)"
 
-  # Get realm-management client ID
-  local rm_client_id _clients_resp
-  _clients_resp="$(\curl -q -LSs --max-time 10 \
-    "${kc_url}/admin/realms/${FREEIPA_KEYCLOAK_REALM}/clients?clientId=realm-management" \
-    -H "Authorization: Bearer ${token}" 2>/dev/null)"
-  rm_client_id="$(printf '%s\n' "${_clients_resp}" | \jq -r 'if type == "array" then .[0].id // empty else empty end' 2>/dev/null || true)"
-
-  if [[ -z "${rm_client_id}" || "${rm_client_id}" == "null" ]]; then
-    __error "Could not find the realm-management client in Keycloak"
+  if [[ -z "${realm_exists}" ]]; then
+    __kc_call POST "/admin/realms" "$(\jq -n --arg r "${FREEIPA_KEYCLOAK_REALM}" --arg d "${FREEIPA_DOMAIN}" \
+      '{realm: $r, enabled: true, displayName: ("SSO — " + $d), sslRequired: "external", registrationAllowed: false, bruteForceProtected: true}')"
+    __log "Realm ${FREEIPA_KEYCLOAK_REALM} created"
+  else
+    __log "Realm ${FREEIPA_KEYCLOAK_REALM} already exists; skipping creation"
   fi
 
-  # Get realm-admin role details
-  local role_info role_id role_name
-  role_info="$(\curl -q -LSs --max-time 10 \
-    "${kc_url}/admin/realms/${FREEIPA_KEYCLOAK_REALM}/clients/${rm_client_id}/roles/realm-admin" \
-    -H "Authorization: Bearer ${token}" 2>/dev/null)"
-  role_id="$(printf '%s\n' "${role_info}" | \jq -r '.id // empty' 2>/dev/null || true)"
-  role_name="$(printf '%s\n' "${role_info}" | \jq -r '.name // empty' 2>/dev/null || true)"
+  # Global administrators: the FreeIPA admins group is a full administrator of Keycloak, both of the realm created
+  # here and of the master realm (the console that manages every realm). The FreeIPA users group stays a plain user
+  # group with no administrative role.
+  __configure_keycloak_federation "${FREEIPA_KEYCLOAK_REALM}"
+  __keycloak_wait_for_user "${FREEIPA_KEYCLOAK_REALM}" "${INSTALL_ADMIN_USERNAME}"
+  __keycloak_grant_group_role "${FREEIPA_KEYCLOAK_REALM}" admins client realm-admin realm-management
+  __keycloak_verify_effective_role "${FREEIPA_KEYCLOAK_REALM}" "${KC_USER_ID}" client realm-admin realm-management
+  __configure_keycloak_groups_claim "${FREEIPA_KEYCLOAK_REALM}"
 
-  if [[ -z "${role_id}" || "${role_id}" == "null" ]]; then
-    __error "Could not find the realm-admin role in Keycloak"
+  __configure_keycloak_federation master
+  __keycloak_grant_group_role master admins realm admin
+  # FreeIPA's built-in admin is not imported into master, so the check needs another administrator
+  if [[ "${INSTALL_ADMIN_USERNAME}" != "admin" ]]; then
+    __keycloak_wait_for_user master "${INSTALL_ADMIN_USERNAME}"
+    __keycloak_verify_effective_role master "${KC_USER_ID}" realm admin
   fi
+  __configure_keycloak_groups_claim master
 
-  # Assign realm-admin role to the admin user
-  __kc_call POST "/admin/realms/${FREEIPA_KEYCLOAK_REALM}/users/${admin_user_id}/role-mappings/clients/${rm_client_id}" \
-    "[$(\jq -n --arg id "${role_id}" --arg name "${role_name}" '{id: $id, name: $name}')]"
-  # Confirm the mapping really exists rather than trusting the POST alone
-  __kc_call GET "/admin/realms/${FREEIPA_KEYCLOAK_REALM}/users/${admin_user_id}/role-mappings/clients/${rm_client_id}"
-  \jq -e --arg n "${role_name}" 'map(.name) | index($n)' <<< "${KC_BODY}" >/dev/null \
-    || __error "realm-admin role is not mapped to the Keycloak admin user"
-
-  __log "Keycloak realm configured. Admin promoted to realm-admin."
+  __log "Keycloak configured. The FreeIPA admins group holds full administrator roles (realm ${FREEIPA_KEYCLOAK_REALM} and master)."
 }
 
 # - - - - - - - - - - - - - - - - - - - - - - - - -
@@ -2744,8 +2862,10 @@ __create_mail_storage() {
     \groupadd -g "${FREEIPA_MAIL_VID}" "${FREEIPA_MAIL_VUSER}"
   fi
   if ! \getent passwd "${FREEIPA_MAIL_VUSER}" >/dev/null 2>&1; then
-    \useradd -r -u "${FREEIPA_MAIL_VID}" -g "${FREEIPA_MAIL_VID}" \
-      -d "${FREEIPA_MAIL_BASE_DIR}" -s /usr/sbin/nologin "${FREEIPA_MAIL_VUSER}"
+    # System account (no home, no mail spool, locked password); pinning the system UID range to this one UID keeps
+    # useradd quiet on stock hosts (SYS_UID_MAX 999) and on hosts whose login.defs moved the ranges
+    \useradd -r -K "SYS_UID_MIN=${FREEIPA_MAIL_VID}" -K "SYS_UID_MAX=${FREEIPA_MAIL_VID}" \
+      -u "${FREEIPA_MAIL_VID}" -g "${FREEIPA_MAIL_VID}" -d "${FREEIPA_MAIL_BASE_DIR}" -s /usr/sbin/nologin "${FREEIPA_MAIL_VUSER}"
   fi
 
   \mkdir -p "${FREEIPA_MAIL_BASE_DIR}/${FREEIPA_MAIL_DOMAIN}"
@@ -3227,7 +3347,9 @@ __display_summary() {
   printf '  Realm:          %s\n' "${FREEIPA_KEYCLOAK_REALM}"
   printf '  LDAP sync:      FreeIPA → Keycloak federation active\n'
   printf '  Groups:         admins, users (read-only mirror of the FreeIPA groups)\n'
-  printf '  Sudo:           FreeIPA admins group (rule admins_all)\n'
+  printf '  Admin access:   FreeIPA admins group = full Keycloak admin (realm %s and master)\n' "${FREEIPA_KEYCLOAK_REALM}"
+  printf '  Group claim:    tokens carry a "groups" claim (admins, users) for apps such as Portainer\n'
+  printf '  Sudo:           FreeIPA admins group (rule admins_all); grant single users with ipa sudorule-add-user\n'
   printf '  Kerberos SPNEGO: HTTP/%s@%s\n' "${FREEIPA_FQDN}" "${FREEIPA_REALM}"
   printf '  Docker compose: %s/docker-compose.yml\n' "${FREEIPA_COMPOSE_DIR}"
   printf '  Credentials:    %s\n' "${FREEIPA_CRED_FILE}"
