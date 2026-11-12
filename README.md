@@ -26,7 +26,7 @@ bash install.sh
 ### What it does
 
 1. **Detects your distro family** — RHEL/Fedora/CentOS (see [Supported distributions](#supported-distributions))
-2. **Checks requirements** — 2 GB+ RAM (4 GB+ recommended), 10 GB+ free disk, valid FQDN
+2. **Checks requirements** — 2 GB+ RAM (4 GB+ recommended) with 1 GB+ available (waits up to 5 minutes for it), 10 GB+ free disk, valid FQDN
 3. **Stops, disables, and masks nginx** when it is installed; FreeIPA Apache owns ports 80 and 443 and the installer does not install nginx
 4. **Installs prerequisites** — Docker CE and `jq` when missing; on DNF5 systems such as current Fedora, the installer adds Docker's repository with `config-manager addrepo --from-repofile`, while DNF4 systems use `config-manager --add-repo`. If Docker is already installed, the installer enables and starts its daemon as needed and verifies it is available before FreeIPA setup, reporting an error if startup or the availability check fails
 5. **Configures `/etc/hosts`, NTP/Chrony, and DNS forwarders** automatically
@@ -108,6 +108,8 @@ solver.
 | `FREEIPA_CRED_FILE` | `/etc/ipa/creds.conf` | Generated-credentials file path |
 | `INSTALL_ADMIN_USERNAME` | `administrator` | Additional FreeIPA administrator login; uses the built-in `admin` password |
 | `FREEIPA_DEBUG` | `0` | Enable debug output when set to `1` (same as `--debug`) |
+| `FREEIPA_MIN_AVAILABLE_MB` | `1024` | Available memory required before the directory server is installed |
+| `FREEIPA_MEMORY_WAIT` | `300` | Seconds to wait for that memory before aborting |
 | `FREEIPA_KEYCLOAK_PORT` | random, 62000–64999 | Keycloak HTTP port |
 | `FREEIPA_KEYCLOAK_REALM` | domain name | Keycloak realm name |
 | `FREEIPA_COMPOSE_DIR` | `/opt/keycloak` | Docker Compose directory |

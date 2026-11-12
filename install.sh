@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # shellcheck shell=bash
 # - - - - - - - - - - - - - - - - - - - - - - - - -
-##@Version           :  202611110100-git
+##@Version           :  202611120110-git
 # @@Author           :  Jason Hempstead
 # @@Contact          :  git-admin@casjaysdev.pro
 # @@License          :  MIT or LICENSE.md
@@ -10,7 +10,7 @@
 # @@Created          :  Thursday, May 22, 2026 14:29 UTC
 # @@File             :  install.sh
 # @@Description      :  Full FreeIPA + Keycloak SSO bootstrap script, distro-agnostic
-# @@Changelog        :  FreeIPA admins group is global admin (Keycloak realms, groups claim, sudo); DNS detection and sudo refresh fixes
+# @@Changelog        :  Wait for available memory before ipa-server-install; Keycloak database password is alphanumeric so Keycloak can always connect
 # @@TODO             :  None
 # @@Other            :
 # @@Resource         :  https://www.freeipa.org/page/Documentation
@@ -20,7 +20,7 @@
 # - - - - - - - - - - - - - - - - - - - - - - - - -
 # shellcheck disable=SC1001,SC1003,SC2001,SC2003,SC2016,SC2031,SC2034,SC2090,SC2115,SC2120,SC2155,SC2199,SC2229,SC2317,SC2329
 # - - - - - - - - - - - - - - - - - - - - - - - - -
-VERSION="202611110100-git"
+VERSION="202611120110-git"
 # - - - - - - - - - - - - - - - - - - - - - - - - -
 APPNAME="${0##*/}"
 RUN_USER="${SUDO_USER:-$USER}"
@@ -71,6 +71,8 @@ INSTALL_ADMIN_USERNAME="${INSTALL_ADMIN_USERNAME:-}"
 INSTALL_ADMIN_PASSWORD=""
 INSTALL_DM_PASSWORD=""
 FREEIPA_DEBUG="${FREEIPA_DEBUG:-0}"
+FREEIPA_MIN_AVAILABLE_MB="${FREEIPA_MIN_AVAILABLE_MB:-1024}"
+FREEIPA_MEMORY_WAIT="${FREEIPA_MEMORY_WAIT:-300}"
 # - - - - - - - - - - - - - - - - - - - - - - - - -
 # Keycloak / LDAP globals
 INSTALL_LDAP_BASE_DN=""
@@ -117,14 +119,17 @@ __primary_ip() {
 }
 
 __random_password() {
-  local length="${1:-32}"
+  local length="${1:-32}" charset='A-Za-z0-9!@$%^&*_+-'
+  # An optional second argument "alnum" limits the charset to letters and digits, for secrets that pass through
+  # JDBC/Quarkus config layers (Keycloak's database password was rejected with some special characters).
+  [[ "${2:-}" == "alnum" ]] && charset='A-Za-z0-9'
   # tr reads /dev/urandom infinitely; head closes the pipe after N bytes, sending
   # SIGPIPE to tr. Run tr in a subshell and absorb the SIGPIPE with || true so
   # set -o pipefail does not propagate tr's exit 141 to the caller.
   # Excludes '#': Dovecot's config parser treats an unescaped '#' as a
   # comment start even mid-line (confirmed breaking dovecot-ldap.conf.ext's
   # dnpass), silently truncating any password that contains one.
-  ( \tr -dc 'A-Za-z0-9!@$%^&*_+-' </dev/urandom 2>/dev/null || true ) | \head -c "${length}"
+  ( \tr -dc "${charset}" </dev/urandom 2>/dev/null || true ) | \head -c "${length}"
   printf '\n'
 }
 
@@ -302,6 +307,8 @@ __help() {
   printf '  FREEIPA_CRED_FILE        Credentials file path (default: /etc/ipa/creds.conf)\n'
   printf '  INSTALL_ADMIN_USERNAME   Additional FreeIPA admin login (default: administrator)\n'
   printf '  FREEIPA_DEBUG            Enable debug output when set to 1 (same as --debug)\n'
+  printf '  FREEIPA_MIN_AVAILABLE_MB Available memory required before ipa-server-install (default 1024)\n'
+  printf '  FREEIPA_MEMORY_WAIT      Seconds to wait for that memory to free up (default 300)\n'
   printf '  FREEIPA_KEYCLOAK_PORT    Override Keycloak port (default: random in 62000-64999)\n'
   printf '  FREEIPA_KEYCLOAK_REALM   Override Keycloak realm (default: domain name)\n'
   printf '  FREEIPA_COMPOSE_DIR      Docker Compose directory (default: /opt/keycloak)\n'
@@ -440,6 +447,34 @@ __preflight_freeipa_state() {
   __log "Aborted FreeIPA install cleaned up"
 }
 
+# 389-ds sizes its caches from the memory available at each start and refuses to start below 128 MB, failing with
+# "dncachememsize value is too large". A hypervisor balloon or a busy host can drop MemAvailable far below MemTotal
+# mid-install, so wait for it to recover instead of letting ipa-server-install die. Usage: __wait_for_available_memory
+__wait_for_available_memory() {
+  local need_kb=$(( FREEIPA_MIN_AVAILABLE_MB * 1024 )) waited=0 avail_kb
+  avail_kb="$(\awk '/MemAvailable/{print $2}' /proc/meminfo || true)"
+  [[ "${avail_kb}" =~ ^[0-9]+$ ]] || return 0
+  if [[ "${avail_kb}" -ge "${need_kb}" ]]; then
+    return 0
+  fi
+  __warn "Only $(( avail_kb / 1024 )) MB of memory is available (need ${FREEIPA_MIN_AVAILABLE_MB} MB); waiting up to ${FREEIPA_MEMORY_WAIT}s"
+  if [[ -d /sys/module/virtio_balloon ]]; then
+    __warn "virtio_balloon is active: the hypervisor may be reclaiming this guest's memory; raise or pin the VM memory"
+  fi
+  while [[ "${avail_kb}" -lt "${need_kb}" && "${waited}" -lt "${FREEIPA_MEMORY_WAIT}" ]]; do
+    \sleep 5
+    waited=$(( waited + 5 ))
+    avail_kb="$(\awk '/MemAvailable/{print $2}' /proc/meminfo || true)"
+    [[ "${avail_kb}" =~ ^[0-9]+$ ]] || return 0
+  done
+  if [[ "${avail_kb}" -lt "${need_kb}" ]]; then
+    local msg="Only $(( avail_kb / 1024 )) MB of memory is available after ${waited}s (need ${FREEIPA_MIN_AVAILABLE_MB} MB); "
+    msg+="the directory server would fail to start. Free memory, or lower FREEIPA_MIN_AVAILABLE_MB to override."
+    __error "${msg}"
+  fi
+  __log "Available memory recovered to $(( avail_kb / 1024 )) MB"
+}
+
 __check_requirements() {
   __log "Checking system requirements..."
 
@@ -463,6 +498,8 @@ __check_requirements() {
   if [[ "${FREEIPA_FQDN}" == "localhost" || "${FREEIPA_FQDN}" == "localhost.localdomain" ]]; then
     __error "Hostname is set to localhost. Configure a proper FQDN first."
   fi
+
+  __wait_for_available_memory
 
   __log "System requirements check passed"
 }
@@ -1205,6 +1242,7 @@ __install_freeipa() {
     done
     __debug "ipa-server-install command:${_shown}"
   fi
+  __wait_for_available_memory
   __heartbeat_start "ipa-server-install"
   "${install_cmd[@]}" || {
     local install_rc=$?
@@ -2035,7 +2073,7 @@ __install_keycloak_docker() {
 
   # Load or generate Keycloak database password
   INSTALL_KEYCLOAK_DB_PASSWORD="$(__load_credential "${FREEIPA_CRED_FILE}" INSTALL_KEYCLOAK_DB_PASSWORD)" || {
-    INSTALL_KEYCLOAK_DB_PASSWORD="$(__random_password 32)"
+    INSTALL_KEYCLOAK_DB_PASSWORD="$(__random_password 32 alnum)"
     __save_credential "${FREEIPA_CRED_FILE}" INSTALL_KEYCLOAK_DB_PASSWORD "${INSTALL_KEYCLOAK_DB_PASSWORD}"
   }
 
